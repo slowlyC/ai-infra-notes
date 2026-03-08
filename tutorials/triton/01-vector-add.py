@@ -4,7 +4,7 @@
 
 在本教程中，您将使用 Triton 编写一个简单的向量加法运算。
 
-通过本教程，您将学习到: 
+通过本教程，你将学习到:
 
 * Triton 的基本编程模型。
 
@@ -34,13 +34,12 @@ def add_kernel(x_ptr,  # *指针* 指向第一个输入向量
                BLOCK_SIZE: tl.constexpr,  # 每个程序应该处理的元素数量
                # 注意: 使用 `constexpr` 以便它可以用作形状值
                ):
-    # 有多个"程序"在处理不同的数据。我们在这里标识我们是哪个程序: 
+    # 有多个"程序"在处理不同的数据, 这里获取当前程序的 ID:
     pid = tl.program_id(axis=0)  # 我们使用一维启动网格，所以轴是 0
-    # 该程序将处理从初始数据block_start开始, 偏移offsets个元素。
-    # 例如，如果你有一个长度为 256 的向量，块大小为 64，那么各个程序
-    # 将分别访问元素 [0:64, 64:128, 128:192, 192:256]。
-    # 注意 offsets 是一个指针列表。
-    block_start = pid * BLOCK_SIZE  # 先定位block的起始位置
+    # 该程序处理从 block_start 开始的 BLOCK_SIZE 个元素。
+    # 例如长度 256、块大小 64 时, 各程序分别访问 [0:64, 64:128, 128:192, 192:256]。
+    # offsets 是一组指针偏移。
+    block_start = pid * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     # 创建一个掩码来保护内存操作，防止越界访问
     mask = offsets < n_elements
@@ -62,8 +61,7 @@ def add_kernel(x_ptr,  # *指针* 指向第一个输入向量
 
 
 # %%
-# 让我们也声明一个辅助函数来 (1) 分配 `z` tensor
-# 和 (2) 使用适当的网格/块大小将上述kernel加入队列: 
+# 辅助函数: (1) 分配输出 tensor; (2) 计算网格大小并启动 kernel:
 
 
 def add(x: torch.Tensor, y: torch.Tensor):
@@ -71,22 +69,22 @@ def add(x: torch.Tensor, y: torch.Tensor):
     output = torch.empty_like(x)
     assert x.device == DEVICE and y.device == DEVICE and output.device == DEVICE
     n_elements = output.numel()
-    # SPMD 启动网格表示并行运行的kernel实例数量。
-    # 它类似于 CUDA 启动网格。它可以是 Tuple[int] 或 Callable(metaparameters) -> Tuple[int]。
-    # 在本例中，我们使用一维网格，其中大小是块的数量: 
+    # SPMD 启动网格表示并行运行的 kernel 实例数, 类似 CUDA launch grid。
+    # 可以是 Tuple[int] 或 Callable(metaparameters) -> Tuple[int]。
+    # 这里使用一维网格, 大小为 ceil(n_elements / BLOCK_SIZE):
     grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']), )
-    # 注意: 
-    #  - 每个 torch.tensor 对象都会隐式转换为指向其第一个元素的指针。
-    #  - `triton.jit` 装饰的函数可以用启动网格进行索引，以获得可调用的 GPU kernel。
-    #  - 不要忘记将元参数作为关键字参数传递。
+    # 注意:
+    #  - torch.tensor 会隐式转换为指向其第一个元素的指针
+    #  - `triton.jit` 装饰的函数可用启动网格索引, 得到可调用的 GPU kernel
+    #  - 元参数需作为关键字参数传递
     add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=1024)
-    # 我们返回 z 的句柄，但是由于还没有调用 `torch.cuda.synchronize()`，kernel此时
-    # 仍在异步运行。
+    # 返回输出 tensor 的句柄; 此时 kernel 仍在异步执行,
+    # 尚未调用 torch.cuda.synchronize()。
     return output
 
 
 # %%
-# 现在我们可以使用上面的函数来计算两个 `torch.tensor` 对象的逐元素和，并测试其正确性: 
+# 计算两个 tensor 的逐元素和并验证正确性:
 
 torch.manual_seed(0)
 size = 98432
@@ -100,15 +98,14 @@ print(f'torch 和 triton 之间的最大差异是 '
       f'{torch.max(torch.abs(output_torch - output_triton))}')
 
 # %%
-# 看起来我们可以开始了！
+# 结果一致, 可以继续。
 
 # %%
 # 基准测试
 # ---------
 #
-# 现在我们可以在不断增大的向量上对我们的自定义算子进行基准测试，以了解它相对于 PyTorch 的表现如何。
-# 为了简化操作，Triton 有一组内置实用工具，可以让我们简洁地绘制自定义算子的性能，
-# 针对不同的问题规模。
+# 在不同向量规模下对自定义算子进行基准测试, 与 PyTorch 对比。
+# Triton 内置了一组性能测试工具, 可以方便地绘制不同规模下的性能曲线。
 
 
 @triton.testing.perf_report(
@@ -137,7 +134,7 @@ def benchmark(size, provider):
 
 
 # %%
-# 现在我们可以运行上面装饰的函数。传递 `print_data=True` 来查看性能数据，`show_plots=True` 来绘制它们，
-# 和/或 `save_path='/path/to/results/'` 将它们与原始 CSV 数据一起保存到磁盘: 
+# 运行基准测试。`print_data=True` 打印性能数据, `show_plots=True` 生成图表,
+# `save_path='/path/to/results/'` 将结果和 CSV 保存到磁盘:
 benchmark.run(print_data=True, show_plots=True)
 

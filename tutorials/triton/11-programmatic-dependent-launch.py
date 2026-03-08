@@ -6,17 +6,17 @@
 有关程序化依赖启动的 CUDA 参考，请参见 https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization。
 有关程序化依赖启动的 PTX 参考，请参见 https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-griddepcontrol。
 
-PDL (Programmatic Dependent Launch) 是 NVIDIA 在较新的 GPU 架构(Hopper H100 及以上，计算能力 9.0+)
-中引入的一种硬件特性，它允许 GPU 上运行的kernel(kernel)直接启动其他依赖的kernel，而无需返回 CPU 主机进行调度。
+PDL (Programmatic Dependent Launch) 是 NVIDIA 在 Hopper (H100, 计算能力 9.0+) 及更新架构
+中引入的硬件特性, 允许 GPU 上运行的 kernel 直接启动依赖 kernel, 无需返回 CPU 调度。
 
-使用 PDL 后: 
-- CPU 启动kernel A(启用 PDL)
+使用 PDL 后:
+- CPU 启动 kernel A (启用 PDL)
 - kernel A 在 GPU 上运行
-- kernel A 直接在 GPU 上启动kernel B(无需 CPU 参与)
+- kernel A 直接在 GPU 上触发 kernel B (无需 CPU 参与)
 - kernel B 开始执行
 
 
-传统模式（无 PDL):
+传统模式 (无 PDL):
 时间线───────────────────────────────────────────────────>
 
 CPU:  [启动kernelA] ──等待──> [同步] ──> [启动kernelB] ──等待──> [同步]
@@ -37,7 +37,7 @@ GPU:    [执行kernelA] ──gdc_launch──> [执行kernelB]
          │                           │
          └─写入GPU内存               └─读取GPU内存
          
-         [kernelA直接触发kernelB, 无需CPU参与]
+         [kernel A 直接触发 kernel B, 无需 CPU 参与]
 
 .. code-block:: bash
     python 11-programmatic-dependent-launch.py

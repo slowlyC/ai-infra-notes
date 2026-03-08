@@ -2,13 +2,15 @@
 Libdevice (`tl.extra.libdevice`) 函数
 ==============================
 Triton 可以从外部库调用自定义函数。
-在本示例中，我们将使用 `libdevice` 库对tensor应用 `asin` 函数。
+本示例使用 `libdevice` 库对 tensor 应用 `asin` 函数。
 
-请参考 `CUDA libdevice-users-guide <https://docs.nvidia.com/cuda/libdevice-users-guide/index.html>`_ 和/或 `HIP device-lib source code <https://github.com/ROCm/llvm-project/tree/amd-staging/amd/device-libs/ocml/src>`_ 了解所有可用 libdevice 函数的语义。
+参考文档:
+- `CUDA libdevice-users-guide <https://docs.nvidia.com/cuda/libdevice-users-guide/index.html>`_
+- `HIP device-lib source code <https://github.com/ROCm/llvm-project/tree/amd-staging/amd/device-libs/ocml/src>`_
 
-在 `libdevice.py` 中，我们尝试将具有相同计算但不同数据类型的函数聚合在一起。
-例如，`__nv_asin` 和 `__nv_asinf` 都计算输入的反正弦的主值，但 `__nv_asin` 操作 `double` 类型，而 `__nv_asinf` 操作 `float` 类型。
-Triton 根据输入和输出类型自动选择要调用的正确底层设备函数。
+`libdevice.py` 将计算相同但数据类型不同的函数聚合在一起。
+例如 `__nv_asin` (double) 和 `__nv_asinf` (float) 都计算反正弦,
+Triton 根据输入输出类型自动选择正确的底层函数。
 """
 
 # %%
@@ -47,12 +49,11 @@ def asin_kernel(
 # %%
 #  使用默认的 libdevice 库路径
 # -----------------------------------------
-# 我们可以使用 `triton/language/math.py` 中编码的默认 libdevice 库路径
+# 使用 `triton/language/math.py` 中编码的默认 libdevice 库路径:
 
 torch.manual_seed(0)
 size = 98432
 x = torch.rand(size, device=DEVICE)
-import pdb; pdb.set_trace()
 output_triton = torch.zeros(size, device=DEVICE)
 output_torch = torch.asin(x)
 assert x.is_cuda and output_triton.is_cuda
@@ -68,7 +69,7 @@ print(f'torch 和 triton 之间的最大差异为 '
 # %%
 #  自定义 libdevice 库路径
 # -------------------------------------
-# 我们也可以通过将 `libdevice` 库的路径传递给 `asin` kernel来自定义 libdevice 库路径。
+# 也可以显式指定 libdevice 库路径:
 def is_cuda():
     return triton.runtime.driver.active.get_current_target().backend == "cuda"
 

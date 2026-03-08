@@ -1,9 +1,10 @@
 """
 块缩放矩阵乘法
 ==================================
-本教程演示了 Triton 实现的块缩放矩阵乘法，它对 FP4 和 FP8 格式通用, 支持 OCP 格式的 mxfp4 和 mxfp8，以及 NVIDIA 的 nvfp4 格式。
+本教程演示 Triton 实现的块缩放矩阵乘法, 对 FP4 和 FP8 格式通用,
+支持 OCP 格式的 mxfp4/mxfp8 以及 NVIDIA 的 nvfp4 格式。
 
-用户可以通过传递 `--format` 参数来运行每种支持的格式的教程，并可以通过指定矩阵维度和迭代步骤来对每种格式的性能进行基准测试。
+通过 `--format` 参数选择格式, 可指定矩阵维度和步长进行基准测试。
 
 .. code-block:: bash
 
@@ -21,36 +22,32 @@
 # 背景
 # ----------
 #
-# 支持 PTX 8.7 及更高版本的 CUDA 设备可以利用块缩放矩阵乘法指令。
-# 为了在tensor核心 MMA 的快速内循环中低延迟访问这些缩放因子，
-# 重要的是确保块缩放因子按照其访问模式以连续的内存layout存储。
+# 支持 PTX 8.7+ 的 CUDA 设备可以利用块缩放矩阵乘法指令。
+# 为在 Tensor Core MMA 内循环中低延迟访问缩放因子,
+# 需要将缩放因子按其访问模式以连续内存 layout 存储。
 #
-# 块缩放矩阵乘法tensor核心指令计算以下乘积: 
+# 块缩放矩阵乘法 Tensor Core 指令计算以下乘积:
 #
 #     C = (A * scale_a) @ (B * scale_b)
 #
 # 其中 scale_a 和 scale_b 是 A 和 B 矩阵的块缩放因子。
-# 在块缩放矩阵乘法下，每个缩放因子在 A 和 B 矩阵的一个向量元素上进行广播和相乘，
-# 通常沿着它们各自的 K 轴。每个缩放因子广播的 A 和 B 元素的数量
-# 在此称为向量大小 (VEC_SIZE)。
+# 每个缩放因子沿 K 轴广播到 A/B 的一个向量, 广播的元素数量称为 VEC_SIZE。
 #
-# 在线性行主layout中，缩放因子将采用以下形状
+# 行主 layout 下, 缩放因子形状为
 #
 #     (M, K // VEC_SIZE) 和 (N, K // VEC_SIZE)   [1]
 #
-# 在全局内存中。然而，为了避免非连续的内存访问，有利于
-# 改为以打包块layout存储缩放因子。对于 LHS 矩阵，此layout为
+# 但为避免非连续内存访问, 建议以打包块 layout 存储。对于 LHS 矩阵, layout 为
 #
 #     (M // 32 // 4, K // VEC_SIZE // 4, 32, 4, 4)   [2]。
 #
-# 通过这种方式，K 块的快速内循环中的每个tensor核心 MMA 可以实现
-# 沿 M 轴的 128 行缩放因子块的连续访问，对于矩阵 A 的每个 BLOCK_M x BLOCK_K 子块。
+# 这样, K 维内循环中每个 Tensor Core MMA 都能连续访问
+# 沿 M 轴的 128 行缩放因子, 对应 A 的每个 BLOCK_M x BLOCK_K 子块。
 #
-# 为了符合 Triton 的 dot_scaled 语言语义，缩放因子
-# 在上述 5D layout [2] 中准备，但随后在逻辑上转置并重塑为
-# tl.dot_scaled 期望的 2D layout [1]。
+# 为符合 Triton 的 `tl.dot_scaled` 语义, 缩放因子先按 5D layout [2] 准备,
+# 然后逻辑转置+重塑为 `tl.dot_scaled` 期望的 2D layout [1]。
 #
-# 有关缩放因子layout的更详细信息，请参见
+# 缩放因子 layout 的详细说明参见
 #  1. https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-scale-factor-a-layout-1x
 #  2. https://docs.nvidia.com/cuda/cublas/#d-block-scaling-factors-layout
 #

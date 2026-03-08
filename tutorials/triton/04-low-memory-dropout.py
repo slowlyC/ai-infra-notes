@@ -5,7 +5,7 @@
 在本教程中，你将编写一个内存高效的 dropout 实现，其状态仅由一个 int32 种子组成。
 这与更传统的 dropout 实现不同，传统实现的状态通常由一个与输入形状相同的位掩码tensor组成。
 
-在此过程中，你将学习到: 
+在此过程中，你将学习到:
 
 * PyTorch 的朴素 Dropout 实现的局限性。
 
@@ -17,17 +17,15 @@
 # 基线实现
 # --------
 #
-# *dropout* 算子最初在 [SRIVASTAVA2014]_ 中引入，作为在低数据环境下（即正则化）
-# 提高深度神经网络性能的一种方法。
+# *dropout* 算子 [SRIVASTAVA2014]_ 是一种正则化方法:
+# 输入向量中的每个元素以概率 :math:`p` 置零, 否则保留。
+# 这迫使网络在仅 :math:`1 - p` 的元素可用时也能正常工作。
 #
-# 它接受一个向量作为输入，并产生一个与输出形状相同的向量。输出中的每个标量都有 :math:`p` 
-# 的概率被改为零，否则从输入中复制。这迫使网络即使只有 :math:`1 - p` 的标量可用时也能表现良好。
+# 评估时令 :math:`p=0`, 但这会增大输出范数 (可能影响 softmax 温度等)。
+# 因此保留的元素乘以 :math:`\frac{1}{1 - p}` (inverted dropout),
+# 使得无论 :math:`p` 取何值, 输出的期望范数保持一致。
 #
-# 在评估时，我们想使用网络的全部能力，因此我们设置 :math:`p=0`。简单地说，这会增加输出的范数
-# （这可能是一件坏事，例如，它可能导致输出 softmax 温度的人为降低）。为了防止这种情况，
-# 我们将输出乘以 :math:`\frac{1}{1 - p}`，这使得无论 dropout 概率如何，范数保持一致。
-#
-# 让我们首先看一下基线实现。
+# 先看基线实现:
 
 import tabulate
 import torch
@@ -86,20 +84,20 @@ print(tabulate.tabulate([
 # 带种子的 Dropout
 # --------------
 #
-# 上面的 dropout 实现工作正常，但处理起来可能有点麻烦。首先，我们需要为反向传播存储 dropout 掩码。
-# 其次，在使用重计算/检查点时，dropout 状态管理会变得非常棘手（例如，参见 
-# https://pytorch.org/docs/stable/checkpoint.html 中关于 `preserve_rng_state` 的所有注释）。
-# 在本教程中，我们将描述一种替代实现，它具有以下优点: 
-# (1) 内存占用更小；(2) 需要更少的数据移动；(3) 简化了在kernel的多次调用中持久化随机性的管理。
+# 上面的实现可以工作, 但有两个问题: (1) 需要存储完整的 dropout 掩码用于反向传播;
+# (2) 与重计算/检查点结合时, 随机状态管理很棘手
+# (参见 https://pytorch.org/docs/stable/checkpoint.html 中 `preserve_rng_state` 的讨论)。
+# 下面介绍一种替代方案, 优势在于:
+# (1) 内存占用更小; (2) 数据移动更少; (3) 多次调用间的随机性管理更简单。
 #
-# Triton 中的伪随机数生成很简单！在本教程中，我们将使用 :code:`triton.language.rand` 函数，
-# 该函数在给定种子和 :code:`int32` 偏移量块的情况下，生成一个在 [0, 1) 中均匀分布的 
-# :code:`float32` 值块。但如果需要，Triton 还提供其他 :ref:`随机数生成策略<Random Number Generation>`。
+# Triton 中的伪随机数生成: :code:`triton.language.rand` 接受种子和 :code:`int32` 偏移量块,
+# 返回 [0, 1) 均匀分布的 :code:`float32` 值块。Triton 也提供其他
+# :ref:`随机数生成策略<Random Number Generation>`。
 #
 # .. note::
 #    Triton 的 PRNG 实现基于 Philox 算法（在 [SALMON2011]_ 中描述）。
 #
-# 让我们把它们放在一起。
+# 完整实现:
 
 
 @triton.jit
@@ -150,8 +148,8 @@ print(
     ]))
 
 # %%
-# 搞定！我们有了一个 triton kernel，只要种子相同，就会应用相同的 dropout 掩码！
-# 如果你想进一步探索 GPU 编程中伪随机性的应用，我们鼓励你探索 `python/triton/language/random.py`！
+# 只要种子相同, 就会产生完全相同的 dropout 掩码——适合重计算场景。
+# 更多 GPU 随机数生成的用法可参考 `python/triton/language/random.py`。
 
 # %%
 # 练习

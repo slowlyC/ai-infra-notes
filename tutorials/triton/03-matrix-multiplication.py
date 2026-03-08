@@ -3,7 +3,7 @@
 =====================
 在本教程中，你将编写一个非常简短的高性能 FP16 矩阵乘法kernel，其性能可以与 cuBLAS 或 rocBLAS 相媲美。
 
-你将具体学习到: 
+你将具体学习到:
 
 * 块级矩阵乘法。
 
@@ -13,16 +13,15 @@
 
 * 自动性能调优。
 
-个块是并行计算的，为什么顺序会影响？三个原因: 
-- 有限的SM数量: 虽然逻辑上"并行",但物理上只有有限的SM, 块会被动态调度
-- 调度器的行为: GPU调度器通常按pid顺序分配块,因此改变pid映射可以影响哪些块"在时间上相邻".
-- 共享的L2缓存: 所有SM共享L2缓存, 但时间上相邻执行的块会竞争缓存空间.
+各块虽是并行计算的，但执行顺序仍然会影响性能，原因有三:
+- 有限的 SM 数量: 逻辑并行, 物理上块被动态调度到有限的 SM
+- 调度器行为: GPU 调度器通常按 pid 顺序分配块, 改变 pid 映射会影响哪些块"时间相邻"
+- 共享 L2 缓存: 所有 SM 共享 L2, 时间相邻的块会竞争缓存空间
 
 
 GROUP_SIZE_M 的作用:
-不是让块"真正并行"(GPU硬件决定并行度),
-而是让"时间上相邻执行"的块也"空间上访问相邻数据"
-从而提高L2缓存命中率.
+不是让块"真正并行"(并行度由 GPU 硬件决定), 而是让"时间相邻"的块也"空间相邻"——访问相近的数据,
+从而提高 L2 缓存命中率。
 """
 
 # %%
@@ -37,7 +36,7 @@ GROUP_SIZE_M 的作用:
 # 在本教程中，你将学习如何使用 Triton 自己实现高效的矩阵乘法，
 # 并且这种方式易于定制和扩展。
 #
-# 粗略地说，我们将要编写的kernel将实现以下分块算法来执行 (M, K) 矩阵与 (K, N) 矩阵的乘法: 
+# 我们要编写的 kernel 实现以下分块算法, 计算 (M, K) x (K, N) 矩阵乘法:
 #
 #  .. code-block:: python
 #
@@ -88,7 +87,7 @@ GROUP_SIZE_M 的作用:
 #    a_ptrs = a_ptr + (offs_am[:, None]*stride_am + offs_k [None, :]*stride_ak)
 #    b_ptrs = b_ptr + (offs_k [:, None]*stride_bk + offs_bn[None, :]*stride_bn)
 #
-# 然后在内部循环中更新如下: 
+# 然后在内部循环中更新如下:
 #
 #  .. code-block:: python
 #
@@ -110,10 +109,10 @@ GROUP_SIZE_M 的作用:
 #    pid_m = pid // grid_n
 #    pid_n = pid % grid_n
 #
-# 是无法满足要求的。
+# 缓存利用率很差。
 #
-# 一个可能的解决方案是按照促进数据重用的顺序启动块。
-# 这可以通过在切换到下一列之前将块"超级分组"为 :code:`GROUP_M` 行来实现: 
+# 解决方案: 按促进数据重用的顺序启动块。
+# 具体做法是将块"超级分组"为 :code:`GROUP_M` 行, 组内按列优先遍历:
 #
 #  .. code-block:: python
 #
@@ -270,9 +269,9 @@ def get_autotune_config():
         return get_hip_autotune_config()
 
 
-# `triton.jit` 装饰的函数可以通过使用 `triton.autotune` 装饰器进行自动调优，它需要: 
-#   - 一个 `triton.Config` 对象列表，定义要尝试的元参数（例如 `BLOCK_SIZE_M`）和编译选项（例如 `num_warps`）的不同配置
-#   - 一个自动调优*键*，其值的变化将触发对所有提供的配置的评估
+# `triton.autotune` 装饰器可以自动搜索最优配置, 需要:
+#   - 一组 `triton.Config`, 定义不同的元参数 (如 BLOCK_SIZE_M) 和编译选项 (如 num_warps)
+#   - 一组 key, 当这些参数变化时会重新搜索最优配置
 @triton.autotune(
     configs=get_autotune_config(),
     key=['M', 'N', 'K'],
@@ -380,8 +379,7 @@ def leaky_relu(x):
 
 
 # %%
-# 现在我们可以创建一个方便的包装函数，它只接受两个输入tensor，
-# 并且 (1) 检查任何形状约束；(2) 分配输出；(3) 启动上述kernel。
+# 包装函数: (1) 检查形状约束; (2) 分配输出; (3) 启动 kernel。
 
 
 def matmul(a, b, activation=""):
@@ -409,7 +407,7 @@ def matmul(a, b, activation=""):
 # 单元测试
 # ---------
 #
-# 我们可以针对原生 torch 实现（即 cuBLAS）测试我们的自定义矩阵乘法操作。
+# 与原生 torch 实现 (cuBLAS) 对比验证正确性:
 
 torch.manual_seed(0)
 a = torch.rand((512, 512), device=DEVICE, dtype=torch.float16) - 0.5
@@ -449,8 +447,7 @@ if TORCH_HAS_FP8 and is_cuda():
 # 方阵性能
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~
 #
-# 现在我们可以将我们的kernel性能与 cuBLAS 或 rocBLAS 的性能进行比较。
-# 这里我们关注方阵，但可以随意调整此脚本以对任何其他矩阵形状进行基准测试。
+# 与 cuBLAS/rocBLAS 性能对比。这里测试方阵, 可自行调整为其他形状。
 
 ref_lib = 'cuBLAS' if is_cuda() else 'rocBLAS'
 

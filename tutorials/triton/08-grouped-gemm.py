@@ -1,8 +1,7 @@
 """
 分组 GEMM
 ============================
-此分组 gemm kernel启动固定数量的 CTA 来计算一组 gemm。
-调度是静态的，我们在设备上执行。
+此分组 GEMM kernel 启动固定数量的 CTA 来计算一组 GEMM, 静态调度在设备端执行。
 """
 
 from typing import Optional
@@ -71,21 +70,19 @@ def num_sms():
 )
 @triton.jit
 def grouped_matmul_kernel(
-    # 矩阵指针的设备tensor
+    # 矩阵指针的设备 tensor
     group_a_ptrs,
     group_b_ptrs,
     group_c_ptrs,
-    # gemm 大小的设备tensor。其形状为 [group_size, 3]
-    # dim 0 是 group_size，dim 1 是每个 gemm 的 <M, N, K> 值
+    # GEMM 尺寸 (设备 tensor), shape [group_size * 3], 存储每个 GEMM 的 <M, N, K>
     group_gemm_sizes,
-    # 前导维度大小的设备tensor。其形状为 [group_size, 3]
-    # dim 0 是 group_size，dim 1 是每个 gemm 的 <lda, ldb, ldc> 值
+    # 前导维度 (设备 tensor), shape [group_size * 3], 存储每个 GEMM 的 <lda, ldb, ldc>
     g_lds,
-    # gemm 数量
+    # GEMM 数量
     group_size,
     # 虚拟 SM 数量
     NUM_SM: tl.constexpr,
-    # tile 大小
+    # tile 尺寸
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -208,21 +205,19 @@ tma_configs = [
 )
 @triton.jit
 def grouped_matmul_tma_kernel(
-    # 矩阵指针的设备tensor
+    # 矩阵指针的设备 tensor
     group_a_ptrs,
     group_b_ptrs,
     group_c_ptrs,
-    # gemm 大小的设备tensor。其形状为 [group_size, 3]
-    # dim 0 是 group_size，dim 1 是每个 gemm 的 <M, N, K> 值
+    # GEMM 尺寸 (设备 tensor), shape [group_size * 3], 存储每个 GEMM 的 <M, N, K>
     group_gemm_sizes,
-    # 前导维度大小的设备tensor。其形状为 [group_size, 3]
-    # dim 0 是 group_size，dim 1 是每个 gemm 的 <lda, ldb, ldc> 值
+    # 前导维度 (设备 tensor), shape [group_size * 3], 存储每个 GEMM 的 <lda, ldb, ldc>
     g_lds,
-    # gemm 数量
+    # GEMM 数量
     group_size,
     # 虚拟 SM 数量
     NUM_SM: tl.constexpr,
-    # tile 大小
+    # tile 尺寸
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,

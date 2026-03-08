@@ -1,12 +1,12 @@
 """
-这是 Tri Dao 的 Flash Attention v2 算法的 Triton 实现 (https://tridao.me/publications/flash2/flash2.pdf)
+Tri Dao Flash Attention v2 的 Triton 实现 (https://tridao.me/publications/flash2/flash2.pdf)
 
-致谢: OpenAI kernel团队
+致谢: OpenAI kernel 团队
 
-额外致谢: 
+额外致谢:
 
-* 原始 flash attention 论文 (https://arxiv.org/abs/2205.14135)
-* Rabe 和 Staats (https://arxiv.org/pdf/2112.05682v2.pdf)
+* 原始 Flash Attention 论文 (https://arxiv.org/abs/2205.14135)
+* Rabe & Staats (https://arxiv.org/pdf/2112.05682v2.pdf)
 
 """
 
@@ -45,7 +45,7 @@ def is_hopper():
 #
 # 标准 Softmax: P = softmax(QK^T) = exp(QK^T) / sum(exp(QK^T))
 #
-# 问题: 需要先算完所有 QK^T 才能知道 sum，无法流式处理
+# 问题: 需要先算完所有 QK^T 才能得到 sum, 无法流式处理
 # Online Softmax 解决方案(假设当前为Qi):
 # ─────────────────────────────────────
 # 维护两个状态:
@@ -637,20 +637,20 @@ class _attention(torch.autograd.Function):
     def forward(ctx, q, k, v, causal, sm_scale, warp_specialize=True):
         # 形状约束: q.shape = [Z, H, N_CTX, HEAD_DIM] # [batch, head, seq_len, head_dim]
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
-        # 注意，在 Hopper 上，我们无法使用非转置的第二个tensor执行 FP8 点积
-        # 当 v 为 float8_e5m2 时，v 会被转置。
+        # Hopper 上无法对非转置的第二个 tensor 执行 FP8 点积,
+        # 当 v 为 float8_e5m2 时需要转置。
         HEAD_DIM_V = v.shape[-1]
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
         assert HEAD_DIM_K in {16, 32, 64, 128, 256}
         o = torch.empty_like(q)
         stage = 3 if causal else 1
         extra_kern_args = {}
-        # AMD 目标的调优
+        # AMD 设备的调优参数
         if is_hip():
             waves_per_eu = 3 if HEAD_DIM_K <= 64 else 2
             extra_kern_args = {"waves_per_eu": waves_per_eu, "allow_flush_denorm": True}
 
-        # 创建一个全0的tensor，用于存储LSE(logsumexp)，用于反向传播时重建 P 矩阵
+        # 全 0 tensor 存储 LSE (logsumexp), 反向传播时用于重建 P 矩阵
         M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
         # 对 Hopper + warpspec 使用 device_descriptor。
         if supports_host_descriptor() and not (is_hopper() and warp_specialize):
@@ -876,8 +876,8 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal, warp_specialize, mode, provider, dtyp
     # 比较
     torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
     rtol = 0.0
-    # AMD Instinct MI200 设备上已知硬件限制的相对容差解决方法。
-    # 详情请参见 https://pytorch.org/docs/stable/notes/numerical_accuracy.html#reduced-precision-fp16-and-bf16-gemms-and-convolutions-on-amd-instinct-mi200-devices
+    # AMD Instinct MI200 的已知硬件限制, 需放宽相对容差。
+    # 详见 https://pytorch.org/docs/stable/notes/numerical_accuracy.html#reduced-precision-fp16-and-bf16-gemms-and-convolutions-on-amd-instinct-mi200-devices
     if torch.version.hip is not None and triton.runtime.driver.active.get_current_target().arch == "gfx90a":
         rtol = 1e-2
     torch.testing.assert_close(tri_dv, ref_dv, atol=1e-2, rtol=rtol)

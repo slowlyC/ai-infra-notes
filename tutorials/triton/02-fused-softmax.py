@@ -5,7 +5,7 @@
 在本教程中，您将编写一个融合的 softmax 操作，对于特定类别的矩阵（其行可以放入 GPU 的 SRAM 中），
 它比 PyTorch 的原生操作快得多。
 
-通过本教程，您将学习到: 
+通过本教程，你将学习到:
 
 * kernel融合对带宽受限操作的好处。
 
@@ -17,8 +17,8 @@
 # 动机
 # -----------
 #
-# 用于逐元素加法的自定义 GPU kernel具有教育价值，但在实践中不会让你走得很远。
-# 让我们考虑一个简单的（数值稳定的）softmax 操作的情况: 
+# 自定义逐元素加法 kernel 虽有教学价值，但实用性有限。
+# 下面来看一个更有意义的例子: 数值稳定的 softmax 操作:
 
 import torch
 
@@ -39,9 +39,9 @@ def is_cdna():
 
 
 def naive_softmax(x):
-    """使用原生 PyTorch 计算 X 的按行 softmax: e^(x - max(x)) / sum(e^(x - max(x)))
+    """使用原生 PyTorch 计算 x 的按行 softmax: e^(x - max(x)) / sum(e^(x - max(x)))
 
-    我们减去最大元素以避免溢出。Softmax 对这种偏移是不变的。
+    减去最大元素以避免溢出, softmax 对这种平移是不变的。
     """
     # 读取 MN 个元素；写入 M 个元素
     x_max = x.max(dim=1)[0]
@@ -57,21 +57,21 @@ def naive_softmax(x):
     return ret
 
 # %%
-# 在 PyTorch 中以简单方式实现时，为 :math:`x \in R^{M \times N}` 计算 :code:`y = naive_softmax(x)` 
-# 需要从 DRAM 读取 :math:`5MN + 2M` 个元素，并写回 :math:`3MN + 2M` 个元素。
-# 这显然是浪费的；我们更希望有一个自定义的"融合"kernel，只读取 X 一次，并在芯片上进行所有必要的计算。
-# 这样做只需要读写 :math:`MN` 字节，因此我们可以预期约 4 倍的理论加速（即 :math:`(8MN + 4M) / 2MN`）。
-# `torch.jit.script` 标志旨在自动执行这种"kernel融合"，但正如我们稍后将看到的，它仍然远非理想。
+# 对 :math:`x \in R^{M \times N}` 计算 :code:`y = naive_softmax(x)` 需要
+# 从 DRAM 读取 :math:`5MN + 2M` 个元素, 写回 :math:`3MN + 2M` 个元素。
+# 这显然很浪费——如果用一个融合 kernel 只读写各 :math:`MN` 字节,
+# 理论加速约 4 倍 (:math:`(8MN + 4M) / 2MN`)。
+# `torch.jit.script` 也能做 kernel 融合, 但效果远不理想。
 
 
 # %%
 # 计算kernel
 # --------------
 #
-# 我们的 softmax kernel工作如下: 每个程序加载输入矩阵 X 的一组行（按程序数跨步），对其进行归一化，并将结果写回输出 Y。
+# softmax kernel 的工作方式: 每个程序按步长跨越多行, 加载 → 归一化 → 写回。
 #
-# 请注意，Triton 的一个重要限制是每个块必须具有 2 的幂次方个元素，
-# 因此如果我们想要处理任何可能的输入形状，我们需要在内部"填充"每一行并正确保护内存操作: 
+# Triton 的一个限制是每个块必须包含 2 的幂个元素,
+# 因此需要内部填充并用 mask 保护越界访问:
 
 @triton.jit
 def softmax_kernel(output_ptr, input_ptr, input_row_stride, output_row_stride, n_rows, n_cols, BLOCK_SIZE: tl.constexpr,
@@ -101,7 +101,7 @@ def softmax_kernel(output_ptr, input_ptr, input_row_stride, output_row_stride, n
 
 
 # %%
-# 我们可以创建一个辅助函数，为任何给定的输入tensor将kernel及其（元）参数加入队列。
+# 辅助函数: 为任意输入 tensor 计算 kernel 参数并启动。
 
 properties = driver.active.utils.get_device_properties(DEVICE.index)
 NUM_SM = properties["multiprocessor_count"]  # 78
@@ -117,8 +117,8 @@ def softmax(x):
     # 每次循环迭代的块大小是大于 x 中列数的最小 2 的幂
     BLOCK_SIZE = triton.next_power_of_2(n_cols)
     
-    # 我们可以使用的另一个技巧是要求编译器通过增加每行分布的 warp 数量（`num_warps`）来使用更多线程。
-    # 您将在下一个教程中看到如何以更自然的方式自动调整此值，这样您就不必自己提出手动启发式方法。
+    # 另一个技巧: 增加 num_warps 让编译器为每行分配更多线程。
+    # 下一个教程会介绍如何用 autotune 自动搜索最优值, 而不必手写启发式。
     num_warps = 8
 
     # 软件流水线阶段数。
@@ -167,8 +167,7 @@ def softmax(x):
 # ---------
 
 # %%
-# 我们确保在具有不规则行数和列数的矩阵上测试我们的kernel。
-# 这将使我们能够验证我们的填充机制是否有效。
+# 使用不规则行数和列数的矩阵测试, 验证填充机制是否正确:
 torch.manual_seed(0)
 x = torch.randn(1823, 781, device=DEVICE)
 y_triton = softmax(x)
@@ -176,14 +175,14 @@ y_torch = torch.softmax(x, axis=1)
 assert torch.allclose(y_triton, y_torch), (y_triton, y_torch)
 
 # %%
-# 正如预期的那样，结果是相同的。
+# 结果一致。
 
 # %%
 # 基准测试
 # ---------
 #
-# 在这里，我们将作为输入矩阵中列数的函数对我们的操作进行基准测试 -- 假设有 4096 行。
-# 然后，我们将其性能与 (1) :code:`torch.softmax` 和 (2) 上面定义的 :code:`naive_softmax` 进行比较。
+# 固定 4096 行, 将列数作为自变量进行基准测试,
+# 对比 (1) :code:`torch.softmax` 和 (2) :code:`naive_softmax`:
 
 
 @triton.testing.perf_report(
@@ -215,7 +214,7 @@ def benchmark(M, N, provider):
 benchmark.run(show_plots=True, print_data=True)
 
 # %%
-# 在上面的图中，我们可以看到: 
-#  - Triton 比 Torch JIT 快 4 倍。这证实了我们的猜测，即 Torch JIT 在这里没有进行任何融合。
-#  - Triton 明显快于 :code:`torch.softmax` -- 除了**更易于阅读、理解和维护**。
-#    但请注意，PyTorch 的 `softmax` 操作更通用，可以处理任何形状的tensor。
+# 从图中可以看到:
+#  - Triton 比 Torch JIT 快约 4 倍, 说明 Torch JIT 没有进行有效融合。
+#  - Triton 明显快于 :code:`torch.softmax`, 同时代码更易读、易维护。
+#    不过 PyTorch 的 softmax 更通用, 支持任意形状的 tensor。

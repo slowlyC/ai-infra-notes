@@ -16,8 +16,8 @@ Triton 和 cuBLAS 实现在不同配置下进行基准测试，并使用 proton 
     # FP16
     python 09-persistent-matmul.py --prec fp16 --K_range 128 1024 --K_step 128
 
-注意: 目前此教程在共享内存较小的设备（如 RTX-4090）上会失败。
-代码结构概览: 
+注意: 目前此教程在共享内存较小的设备 (如 RTX-4090) 上会失败。
+代码结构概览:
 │
 ├── 辅助函数
 │   ├── is_cuda()           # 检查是否为 CUDA
@@ -783,7 +783,6 @@ if __name__ == "__main__":
             args.K_step = 1  # 只要不为 0 就无关紧要
 
         torch.manual_seed(0)
-        import pdb; pdb.set_trace()
         validate(32, 32, 32, dtype)
         validate(8192, 8192, args.K_range[0], dtype)
 

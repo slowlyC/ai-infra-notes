@@ -74,8 +74,8 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 # 1. LayerNorm (层归一化)
 # --------------------------
 #
-# *LayerNorm* 最初在 [BA2016]_ 中引入，用于提高序列模型（如 Transformers）的训练稳定性。
-# 它接受一个向量 :math:`x` 作为输入，先减去均值、除以标准差，再应用可学习的仿射变换。
+# *LayerNorm* [BA2016]_ 用于提高序列模型 (如 Transformer) 的训练稳定性。
+# 对输入向量 :math:`x` 先减均值、除标准差, 再施加可学习的仿射变换。
 #
 # 前向传播:
 #
@@ -159,15 +159,12 @@ def pytorch_layer_norm(x, weight, bias, eps=1e-5):
 #   - 没有 bias β (对比 LayerNorm)，实践证明去掉 β 对效果影响很小
 #
 # 与 LayerNorm 的区别:
-#   ┌─────────────┬──────────────────────┬──────────────────────┐
-#   │             │ LayerNorm            │ RMSNorm              │
-#   ├─────────────┼──────────────────────┼──────────────────────┤
-#   │ 均值中心化  │ ✓ (x - mean)         │ ✗                    │
-#   │ 缩放因子    │ 1/√(var + ε)         │ 1/√(mean(x²) + ε)   │
-#   │ 可学习参数  │ weight + bias        │ 仅 weight            │
-#   │ 前向遍历    │ 3次(mean,var,norm)   │ 2次(mean_sq,norm)    │
-#   │ 应用场景    │ BERT, GPT-2, T5      │ LLaMA, Gemma, Qwen   │
-#   └─────────────┴──────────────────────┴──────────────────────┘
+#                  LayerNorm              RMSNorm
+#   均值中心化     ✓ (x - mean)           ✗
+#   缩放因子       1/√(var + ε)           1/√(mean(x²) + ε)
+#   可学习参数     weight + bias          仅 weight
+#   前向遍历       3次(mean,var,norm)     2次(mean_sq,norm)
+#   应用场景       BERT, GPT-2, T5        LLaMA, Gemma, Qwen
 #
 # 反向传播:
 #   设 x̂ = x * rstd, wdy = w ⊙ dy
@@ -325,11 +322,11 @@ def _layer_norm_fwd_fused(
 # 反向传播
 # -------------
 #
-# 层归一化算子的反向传播比前向传播稍微复杂一些。
-# 由于同一批次中的所有行都使用相同的权重 :math:`w` 和偏置 :math:`b`，因此它们的梯度需要求和。
-# 为了有效地执行此步骤，我们使用并行归约策略: 每个kernel实例将部分 :math:`\nabla_{w}` 和
-# :math:`\nabla_{b}` 累积到 :math:`\text{GROUP_SIZE_M}` 个独立缓冲区之一中的某些行中。
-# 这些缓冲区保留在 L2 缓存中，然后由另一个函数进一步归约以计算实际的 :math:`\nabla_{w}` 和 :math:`\nabla_{b}`。
+# 反向传播比前向略复杂。
+# 同一批次所有行共享权重 :math:`w` 和偏置 :math:`b`, 其梯度需要跨行求和。
+# 采用并行归约策略: 每个 kernel 实例将部分 :math:`\nabla_{w}` 和
+# :math:`\nabla_{b}` 累积到 :math:`\text{GROUP_SIZE_M}` 个独立缓冲区中。
+# 这些缓冲区留在 L2 缓存, 再由另一个 kernel 做最终归约。
 #
 #   .. image:: parallel_reduction.png
 #
@@ -1038,13 +1035,10 @@ print("=" * 70)
 #   - L2Norm:    最简版 = L2范数缩放，无可学习参数
 #
 # 三、Triton 实现对比
-# ┌───────────┬──────────┬────────────────────────┬────────────────────────┐
-# │ 方法      │ 前向遍历 │ 反向计算               │ 梯度累积               │
-# ├───────────┼──────────┼────────────────────────┼────────────────────────┤
-# │ LayerNorm │ 3 次     │ dx 含 c₁ 和 c₂ 两项    │ 需要并行归约 dw, db    │
-# │ RMSNorm   │ 2 次     │ dx 仅含 c₁ 项          │ 需要并行归约 dw        │
-# │ L2Norm    │ 2 次     │ dx 用 dot(dy,y)        │ 无需归约 (无参数)      │
-# └───────────┴──────────┴────────────────────────┴────────────────────────┘
+#   方法        前向遍历   反向计算                梯度累积
+#   LayerNorm   3 次       dx 含 c₁ 和 c₂ 两项    需要并行归约 dw, db
+#   RMSNorm     2 次       dx 仅含 c₁ 项          需要并行归约 dw
+#   L2Norm      2 次       dx 用 dot(dy,y)       无需归约 (无参数)
 #
 # 四、性能特点
 #   1. LayerNorm 前向需要 3 次遍历数据 (mean → var → normalize)，反向最复杂
