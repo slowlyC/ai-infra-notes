@@ -445,17 +445,17 @@ def _attn_bwd_dq(dq, q, K, V,  #
 #
 #            K,V 块 →    0     1     2     3     4
 #                     ┌─────┬─────┬─────┬─────┬─────┐
-#     Q 块  0         │  ◉  │  ×  │  ×  │  ×  │  ×  │
-#            1        │  √  │  ◉  │  ×  │  ×  │  ×  │
-#            2  ←pid  │  √  │  √  │  ◉  │  ×  │  ×  │  ← dQ 处理这行(从右往左)
-#            3        │  √  │  √  │  √  │  ◉  │  ×  │
+#     Q 块  0         │  ◉  │  x  │  x  │  x  │  x  │
+#            1        │  √  │  ◉  │  x  │  x  │  x  │
+#            2  ←pid  │  √  │  √  │  ◉  │  x  │  x  │  ← dQ 处理这行(从右往左)
+#            3        │  √  │  √  │  √  │  ◉  │  x  │
 #            4        │  √  │  √  │  √  │  √  │  ◉  │
 #                     └─────┴─────┴─────┴─────┴─────┘
 #                                    ↑
 #                           dK,dV 处理这列(从上往下)
 #     ◉ = on-band (需要 mask)
 #     √ = off-band (不需要 mask)
-#     × = 跳过 (causal 外)
+#     x = 跳过 (causal 外)
 #
 # ═══════════════════════════════════════════════════
 # 【调用1】_attn_bwd_dkdv(MASK=True)
@@ -761,12 +761,12 @@ class _attention(torch.autograd.Function):
         # 在bwd kernel中会用到:
         #   MASK_BLOCK_M1 = BLOCK_M1 // BLK_SLICE_FACTOR = 32 // 2 = 16
         #   MASK_BLOCK_N2 = BLOCK_N2 // BLK_SLICE_FACTOR = 32 // 2 = 16
-        # 由于对角线块(on-band)有一半是无效的，用更小的块 (16×16) 可以更精细地处理对角线块
+        # 由于对角线块(on-band)有一半是无效的，用更小的块 (16x16) 可以更精细地处理对角线块
         #  ┌──┬──┬──┬──┐                                                      
-        #  │ ✓│ ×│  │  │  ← 块大小 16×16                                     
+        #  │ ✓│ x│  │  │  ← 块大小 16x16                                     
         #  │ ✓│ ✓│  │  │    更精细地处理边界                                
         #  ├──┼──┼──┼──┤                                                      
-        #  │  │  │ ✓│ ×│                                                      
+        #  │  │  │ ✓│ x│                                                      
         #  │  │  │ ✓│ ✓│                                                      
         #  └──┴──┴──┴──┘               
         BLK_SLICE_FACTOR = 2
@@ -780,7 +780,7 @@ class _attention(torch.autograd.Function):
         # 预处理阶段, 计算delta = tl.sum(o * do, axis=1) # 对应论文第4行: D = rowsum(do ⊙ o)
         # 为什么需要 D? 
         # 在计算 dS 时: dS = P ⊙ (dP - D)  # 对应论文第14行
-        # 推导: dS_ij = P_ij × (dP_ij - Σ_k P_ik × dP_ik) = P_ij × (dP_ij - D_i) 
+        # 推导: dS_ij = P_ij x (dP_ij - Σ_k P_ik x dP_ik) = P_ij x (dP_ij - D_i) 
         _attn_bwd_preprocess[pre_grid](
             o, do,  #
             delta,  #

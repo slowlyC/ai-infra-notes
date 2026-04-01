@@ -277,7 +277,7 @@ def test_pipelined_matmul(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, num_buffers, num_w
 # 对于我们的 kernel, 最佳块尺寸是BLOCK_M=128、BLOCK_N=256, 这是在 Blackwell 和 Hopper 上都能使用的最大指令形状。
 # 但在 Hopper 上需要 8 个 warp 才能容纳累加器所需的寄存器。
 # 原因: 
-# 累加器大小 = BLOCK_M × BLOCK_N = 128 × 256 = 32,768 个 float32
+# 累加器大小 = BLOCK_M x BLOCK_N = 128 x 256 = 32,768 个 float32
 # 每个线程最多只能使用 256 个寄存器
 # 4 个 warp(128 线程): 32768 ÷ 128 = 256 寄存器/线程。达到极限, 可能溢出。
 # 为什么 Blackwell 可以用 4 个 warp？
@@ -595,9 +595,9 @@ if __name__ == "__main__" and not profiling_with_ncu:
 #
 # 但这样做会让 TMA 存储缓冲区的生命周期与操作数缓冲区重叠, 因为原先A/B 和 C 的生命周期不重叠, C_buf可以和 A/B 共享同一块内存。
 # Hopper和Blackwell的共享内存大小都是228KB, 在配置: BLOCK_M=128, BLOCK_N=256, BLOCK_K=64, dtype=fp16时,
-# A_buf = BLOCK_M × BLOCK_K × 2 bytes = 128 × 64 × 2  = 16 KB
-# B_buf = BLOCK_K × BLOCK_N × 2 bytes = 64 × 256 × 2  = 32 KB
-# C_buf = BLOCK_M × BLOCK_N × 2 bytes = 128 × 256 × 2 = 64 KB
+# A_buf = BLOCK_M x BLOCK_K x 2 bytes = 128 x 64 x 2  = 16 KB
+# B_buf = BLOCK_K x BLOCK_N x 2 bytes = 64 x 256 x 2  = 32 KB
+# C_buf = BLOCK_M x BLOCK_N x 2 bytes = 128 x 256 x 2 = 64 KB
 # 原先(A+B)*4=192KB<228KB, 但是重叠后(A+B)*4+C=256KB>228KB, 因此最多只能用 3 个缓冲区≈208KB。
 # 从前面的性能结果看, Hopper 用 3 个缓冲区问题不大, 但 Blackwell 可能会掉性能, 这是因为Blackwell 的 MMA 吞吐量更高, 需要更多缓冲区来隐藏延迟。
 # 

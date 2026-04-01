@@ -62,7 +62,7 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 #     RMS = √((4+16+36)/3) ≈ 4.32  # 均方根
 #     x/RMS = [0.46, 0.93, 1.39]   # 归一化后，数值范围变小
 #     γ = [1.5, 1.0, 0.8]          # 可学习参数
-#     output = γ × (x/RMS) = [0.69, 0.93, 1.11]  # 恢复到合适范围
+#     output = γ x (x/RMS) = [0.69, 0.93, 1.11]  # 恢复到合适范围
 #
 # β (bias / 偏置) — 可学习的平移参数 (仅 LayerNorm 有)
 #   形状为 [N]，初始化为全 0

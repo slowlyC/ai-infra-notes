@@ -12,7 +12,7 @@
 
 # %%
 # Tensor Memory 介绍:
-# Tensor memory 是一个二维内存空间, 在每个 CTA 上有 128 行 × 512 列的单元, 每个单元为 32 bit, 与寄存器文件大小相同。
+# Tensor memory 是一个二维内存空间, 在每个 CTA 上有 128 行 x 512 列的单元, 每个单元为 32 bit, 与寄存器文件大小相同。
 # 访问 Tensor memory 比共享内存更快, 但也有一些额外的限制:
 
 # - 每个 warp 只能根据其 warp ID 访问其中的 32 行, 因此需要整个 warp 组(4个warp)协同才能访问全部 128 行物理空间。
@@ -26,7 +26,7 @@
 
 # 关于 Tensor memory 的几点补充说明:
 # - Tensor memory 本质上是一个额外的寄存器文件。
-#   128 × 512 = 65536 个 32 bit单元, 恰好与一个SM上的总寄存器文件大小相同(65536个32位寄存器=256KB)。
+#   128 x 512 = 65536 个 32 bit单元, 恰好与一个SM上的总寄存器文件大小相同(65536个32位寄存器=256KB)。
 # - Tensor memory 可以独立于 MMA 指令使用。
 #   只要满足 layout 限制, 它可以作为共享内存的替代方案来传输数据。
 # - Tensor memory 在 SM 上动态分配, 虽然不会直接影响占用率, 但如果可用空间不足, 分配操作会被阻塞。
@@ -495,12 +495,12 @@ if __name__ == "__main__":
 # 【kernel 设计】
 # 这个 kernel 同时计算输出矩阵 C 的两行块(上下相邻):
 
-#   矩阵 A (M×K)         矩阵 B (K×N)       矩阵 C (M×N)
+#   矩阵 A (MxK)         矩阵 B (KxN)       矩阵 C (MxN)
 #   ┌─────────┐          ┌─────┐           ┌─────┐
-#   │   U1    │ 128×128  │ B1  │ 128×128   │ UB  │ 128×128  <- 上方输出块
-#   │ (upper) │    ×     │     │    =      │     │
+#   │   U1    │ 128x128  │ B1  │ 128x128   │ UB  │ 128x128  <- 上方输出块
+#   │ (upper) │    x     │     │    =      │     │
 #   ├─────────┤          └─────┘           ├─────┤
-#   │   V1    │ 128×128                    │ VB  │ 128×128  <- 下方输出块
+#   │   V1    │ 128x128                    │ VB  │ 128x128  <- 下方输出块
 #   │ (lower) │                            │     │
 #   └─────────┘                            └─────┘
 
@@ -517,9 +517,9 @@ if __name__ == "__main__":
 # - 要求 BLOCK_M = BLOCK_N = 128, 并对所有输入进行双缓冲
 
 # 【SMEM 使用量计算】(当 BLOCK_K = 128 时)
-# - u_bufs: [2, 128, 128] fp16 = 2 × 128 × 128 × 2 bytes = 64 KB(双缓冲的上方A块)
-# - v_bufs: [2, 128, 128] fp16 = 2 × 128 × 128 × 2 bytes = 64 KB(双缓冲的下方A块)
-# - b_bufs: [2, 128, 128] fp16 = 2 × 128 × 128 × 2 bytes = 64 KB(双缓冲的B块)
+# - u_bufs: [2, 128, 128] fp16 = 2 x 128 x 128 x 2 bytes = 64 KB(双缓冲的上方A块)
+# - v_bufs: [2, 128, 128] fp16 = 2 x 128 x 128 x 2 bytes = 64 KB(双缓冲的下方A块)
+# - b_bufs: [2, 128, 128] fp16 = 2 x 128 x 128 x 2 bytes = 64 KB(双缓冲的B块)
 # - 其他: mbarriers 等 ≈ 几百字节(可忽略)
 # - 总计: 64 + 64 + 64 = 192 KB
 
@@ -534,14 +534,14 @@ if __name__ == "__main__":
     # Load U2, B2, V2          # 预加载第2轮(k=128:256)
     
     # 循环开始(i=1):
-    #     Wait U1,B1 → Compute UB1   # 计算 A[upper, 0:128] × B[0:128, :]
-    #     Wait V1    → Compute VB1   # 计算 A[lower, 0:128] × B[0:128, :]
+    #     Wait U1,B1 → Compute UB1   # 计算 A[upper, 0:128] x B[0:128, :]
+    #     Wait V1    → Compute VB1   # 计算 A[lower, 0:128] x B[0:128, :]
     #     Wait UB1   → Load U3, B3   # load第3轮(k=256:384)
     #     Wait VB1   → Load V3       
     
     # 循环继续(i=2):
-    #     Wait U2,B2 → Compute UB2   # 计算 A[upper, 128:256] × B[128:256, :]
-    #     Wait V2    → Compute VB2   # 计算 A[lower, 128:256] × B[128:256, :]
+    #     Wait U2,B2 → Compute UB2   # 计算 A[upper, 128:256] x B[128:256, :]
+    #     Wait V2    → Compute VB2   # 计算 A[lower, 128:256] x B[128:256, :]
     #     Wait UB2   → Load U4, B4   # load第4轮(k=384:512)
     #     Wait VB2   → Load V4
     
@@ -790,8 +790,8 @@ if __name__ == "__main__":
 # 这说明当前 kernel 受内存延迟限制(memory-bound), 而非计算限制(compute-bound)。
 
 # 具体数字 (假设 K=16384):
-#   BLOCK_K=128: 128 次迭代 × 较长的 MMA 时间 × 低占用率(1 block/SM) = 2.16 ms
-#   BLOCK_K=64:  256 次迭代 × 较短的 MMA 时间 × 高占用率(2 block/SM) = 1.97 ms ✓
+#   BLOCK_K=128: 128 次迭代 x 较长的 MMA 时间 x 低占用率(1 block/SM) = 2.16 ms
+#   BLOCK_K=64:  256 次迭代 x 较短的 MMA 时间 x 高占用率(2 block/SM) = 1.97 ms ✓
 #   虽然迭代次数翻倍, 但更高的占用率带来了 ~9% 的性能提升
 
 # 【num_warps=8 的作用】

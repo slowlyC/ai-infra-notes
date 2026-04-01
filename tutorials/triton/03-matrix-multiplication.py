@@ -143,8 +143,8 @@ GROUP_SIZE_M 的作用:
 #   .. image:: grouped_vs_row_major_ordering.png
 # 注意: 官方图不是展示完整的一组，而是展示计算前9个输出块时的对比！
 #
-#        9×9 的块网格，GROUP_SIZE_M = 3
-#        其中每个格子是一个程序,每个程序实例内部处理 BLOCK_SIZE_M×BLOCK_SIZE_N 个元素
+#        9x9 的块网格，GROUP_SIZE_M = 3
+#        其中每个格子是一个程序,每个程序实例内部处理 BLOCK_SIZE_MxBLOCK_SIZE_N 个元素
 # 
 #                   9个块列 (num_pid_n)
 #          ┌───────────────────────────────────┐

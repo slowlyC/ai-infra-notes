@@ -332,7 +332,7 @@ class ProgramScheduler:
         num_pid_m = gl.cdiv(config.N_CTX, config.BLOCK_M)
         num_pid_n = config.Z * config.H
         num_pid_in_group = num_pid_m * config.GROUP_SIZE_N
-        num_tiles = num_pid_m * num_pid_n  # 总 tile 数: (seq_len 方向的 tile 数) × (batch × heads) 
+        num_tiles = num_pid_m * num_pid_n  # 总 tile 数: (seq_len 方向的 tile 数) x (batch x heads) 
         return ProgramScheduler(config, start_pid, num_pid_n, num_pid_in_group, num_tiles)
 
     @gluon.jit
@@ -365,9 +365,9 @@ class AttentionProgram:
     def __init__(self, config, start_m, off_hz, offset_y, qo_offset_y):
         self.config = config
         self.start_m = start_m  # pid_m, Q 的起始行 tile 索引
-        self.off_hz = off_hz  # batch_idx × H + head_idx, batch-head 的线性索引
-        self.offset_y = offset_y  # off_z × (N_CTX × H) + off_h × N_CTX, K/V 在 global mem 的 offset
-        self.qo_offset_y = qo_offset_y  # offset_y + start_m × BLOCK_M, Q/O 在 global mem 的 offset
+        self.off_hz = off_hz  # batch_idx x H + head_idx, batch-head 的线性索引
+        self.offset_y = offset_y  # off_z x (N_CTX x H) + off_h x N_CTX, K/V 在 global mem 的 offset
+        self.qo_offset_y = qo_offset_y  # offset_y + start_m x BLOCK_M, Q/O 在 global mem 的 offset
 
     @gluon.jit
     def get_fused_loop_bounds(self, STAGE: gl.constexpr):
@@ -936,7 +936,7 @@ def _attn_fwd_correction_rescale(config, s_tmem, corr_consumer, o_consumer):
     for i in gl.static_range(config.SPLIT_D_FACTOR):
         o_ref = o_tmem.slice(i * config.SPLIT_D, config.SPLIT_D)
         o = float2.pack(o_ref.load(config.o_splitn_layout), axis=1)
-        o = o * alpha  # rescale! float2 × float2 (使用 FMUL2 指令)
+        o = o * alpha  # rescale! float2 x float2 (使用 FMUL2 指令)
         o_ref.store(float2.unpack(o, axis=1))
     # 通知 MMA partition 可以继续进行
     mbarrier.arrive(o_bar, count=1)
@@ -1074,12 +1074,12 @@ def attention_kernel(  #
     descs = (desc_q, desc_k, desc_v, desc_o)
     # 
     # 分区	               Warps Regs/Thread  Threads	该分区总寄存器
-    # Correction (默认)	     4	    128	     4×32=128	128 × 128 = 16,384(maxnreg)
-    # Softmax0 (Worker 0)	4	   192	    4×32=128   128 × 192 = 24,576
-    # Softmax1 (Worker 1)	4	   192	    4×32=128   128 × 192 = 24,576
-    # MMA (Worker 2)	    1	   24	    1×32=32	   32 × 24 = 768
-    # Load (Worker 3)	    1	   24	    1×32=32	   32 × 24 = 768
-    # Epilogue (Worker 4)	1	   24	    1×32=32	   32 × 24 = 768
+    # Correction (默认)	     4	    128	     4x32=128	128 x 128 = 16,384(maxnreg)
+    # Softmax0 (Worker 0)	4	   192	    4x32=128   128 x 192 = 24,576
+    # Softmax1 (Worker 1)	4	   192	    4x32=128   128 x 192 = 24,576
+    # MMA (Worker 2)	    1	   24	    1x32=32	   32 x 24 = 768
+    # Load (Worker 3)	    1	   24	    1x32=32	   32 x 24 = 768
+    # Epilogue (Worker 4)	1	   24	    1x32=32	   32 x 24 = 768
     # 总寄存器需求: 16,384 + 24,576 + 24,576 + 768 + 768 + 768 = 67,840 个寄存器 > 65,536, 所以默认分区寄存器数会小于128
     #
     # 为什么 Softmax 需要 192 个寄存器/线程？

@@ -317,8 +317,8 @@ def elementwise_add_warp_specialized(a, b, c, XBLOCK=32, YBLOCK=64,  #
     # 因此我们需要显式设置寄存器限制, 避免寄存器使用过多。
     # 该 kernel 中总共将有 `num_warps+4` 个 warp, 其中 num_warps 是默认分区的 warp 数, 
     # 两个工作分区各使用 1 个 warp, 但由于 warp group 对齐到 4 的倍数, 2 个工作 warp 实际会占用 4 个 warp 的资源槽位。
-    # 总寄存器使用量为: maxnreg * (num_warps+4) * 32, maxnreg = 256, num_warps= 4 时共 256 × (4+4) × 32 = 65536 个寄存器, 为单个 SM 的上限。
-    # 由于我们设置了 worker_num_regs, 实际使用的寄存器数为(maxnreg × num_warps + 24×4) * 32	= 35824 个
+    # 总寄存器使用量为: maxnreg * (num_warps+4) * 32, maxnreg = 256, num_warps= 4 时共 256 x (4+4) x 32 = 65536 个寄存器, 为单个 SM 的上限。
+    # 由于我们设置了 worker_num_regs, 实际使用的寄存器数为(maxnreg x num_warps + 24x4) * 32	= 35824 个
     # 较低的寄存器使用量可以提高 occupancy(每个 SM 能并发运行更多线程块), 从而可能获得更好的性能。在规划 occupancy 时需要考虑这一点。
     elementwise_add_warp_specialized_kernel[grid](  #
         a_desc, b_desc, c_desc, xnumel, ynumel,  #
@@ -392,8 +392,8 @@ if __name__ == "__main__":
 #
 # 因为 epilogue 是重叠的, 我们可以通过设置 subtile=4 来允许 4 个缓冲区(对应代码_split_n(acc, p.SUBTILE_FACTOR))。
 # 不过在 K 较小时, 复用 B 可能仍然更好。
-# 不使用 subtile (SUBTILE_FACTOR=1): Epilogue SMEM: [128 × 256] × 2B(fp16) = 64 KB  ← 很大！
-# 使用 subtile (SUBTILE_FACTOR=4): Epilogue SMEM: [128 × 64] × 2B(fp16) = 16 KB  ← 只需要 1/4！
+# 不使用 subtile (SUBTILE_FACTOR=1): Epilogue SMEM: [128 x 256] x 2B(fp16) = 64 KB  ← 很大！
+# 使用 subtile (SUBTILE_FACTOR=4): Epilogue SMEM: [128 x 64] x 2B(fp16) = 16 KB  ← 只需要 1/4！
 # 因为 epilogue 分 4 次存储: 
 #   for i in range(4):  # SUBTILE_FACTOR = 4
 #       acc_smem.store(accs[i])      # 只需要 [128, 64] 的缓冲区
@@ -591,7 +591,7 @@ def _split_n(x, SUBTILE_FACTOR: gl.constexpr):
         for j in gl.static_range(len(xs)):
             x = xs[j]
             # 重塑为 (M, 2, N//2), 然后进行 permute, 再进行 split, 以便 tensor 元素沿 N 保持连续。
-            # [M, N] → [M, 2, N//2] → [M, N//2, 2] → split → 2×[M, N//2]
+            # [M, N] → [M, 2, N//2] → [M, N//2, 2] → split → 2x[M, N//2]
             next_xs += x.reshape(x.shape[0], 2, x.shape[1] // 2).permute(0, 2, 1).split()
         xs = next_xs
     return xs
