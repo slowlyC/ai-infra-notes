@@ -8,7 +8,7 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-# 这是第二个教程 GEMM. 在第一个教程基础上添加了 2CTA MMA 指令及 2x1 cluster.
+# 这是第二个 GEMM 教程. 在第一个教程基础上添加了 2CTA MMA 指令及 2x1 cluster.
 
 
 import argparse
@@ -23,7 +23,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.runtime import from_dlpack
 
 """
-第二个教程 GEMM, 相较 `fp16_gemm_0.py`, 本示例增加了 2CTA MMA 与 TMA multicast 支持.
+第二个 GEMM 教程, 相较 `fp16_gemm_0.py`, 本示例增加了 2CTA MMA 与 TMA multicast 支持.
 
 当 `fp16_gemm_0.py` 在较高 SM 频率下运行时, dram 延迟会成为潜在性能瓶颈. 本示例的优化:
 
@@ -67,10 +67,21 @@ A 各不相同 → 无法 multicast, 各自从 L2 读取.
   2x1 cluster:   16KB / 1 + 32KB / 2 = 24KB
   4x4 cluster:   16KB / 4 + 32KB / 4 = 12KB
 
-总结: 
+总结:
 2CTA MMA 是硬件通过 DSMEM 让两个 CTA 共享 B 数据。每个 CTA 只需存 B 的一半到 SMEM, MMA 指令自动跨 CTA 读取另一半。
-而 TMA multicast 是一次从 L2 读取 B 数据，分发到两个 CTA 各自需要的那一半。因为 B 已经通过 2CTA 分半了， 实际没有进行multicast。
-2CTA 提供更强的延迟掩盖能力, TMA multicast 缩短数据就绪时间. 在延迟/内存带宽受限场景下需综合考虑.
+而 TMA multicast 是一次从 L2 读取 B 数据, 分发到两个 CTA 各自需要的那一半。因为 B 已经通过 2CTA 分半了, 实际没有进行multicast。
+2CTA 提供更强的延迟掩盖能力, TMA multicast 缩短数据就绪时间, 在延迟/内存带宽受限场景下需综合考虑.
+
+Cluster、2CTA MMA、TMA multicast 是三个独立的概念, 但存在依赖关系:
+  Cluster 是前提, 通过 .launch(cluster=...) 开启, cluster 内的 CTA 获得 DSMEM 互访, TMA multicast, barrier 同步等能力.
+  2CTA MMA 依赖 cluster (>=2),两个 CTA 通过 DSMEM 共享操作数, 协作执行一条 MMA 指令.
+  TMA multicast 依赖 cluster (>=2), 一次 TMA load 广播到多个 CTA 的 SMEM, 减少 L2 流量.
+  2CTA MMA 和 TMA multicast 之间互不依赖, 可以单独使用, 也可以组合.
+
+不同组合下的效果 (以 2x1 cluster, B tensor 为例):
+  1CTA MMA + multicast: 每个 CTA 在 SMEM 中存完整 B tile, 但 TMA 只从 L2 读一次再广播, L2 流量减半.
+  2CTA MMA 无 multicast: 每个 CTA 只存半个 B tile (SMEM 减半), 但各自独立从 L2 读取.
+  2CTA MMA + multicast: SMEM 减半, L2 流量也减半, 两种优化叠加.
 
 
 运行本示例:
@@ -129,10 +140,10 @@ def kernel(
     cta_in_cluster_coord_vmnk = cta_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
     # mma_coord_vmnk[0] 为 CTA 在 2CTA MMA 中的编号 (0=leader, 1=follower)
     mma_coord_vmnk = (
-        bidx % cute.size(cta_layout_vmnk, mode=[0]),
-        bidx // cute.size(cta_layout_vmnk, mode=[0]),
-        bidy,
-        None,
+        bidx % cute.size(cta_layout_vmnk, mode=[0]),   # 低位 → 组内角色 (0=leader, 1=follower)
+        bidx // cute.size(cta_layout_vmnk, mode=[0]),  # 高位 → M 维第几个 output tile
+        bidy,  # y 方向直接对应 N 维 tile
+        None,  # K 维不做空间划分
     )
     mma_coord_mnk = mma_coord_vmnk[1:]
 

@@ -43,17 +43,17 @@ def naive_softmax(x):
 
     减去最大元素以避免溢出, softmax 对这种平移是不变的。
     """
-    # 读取 MN 个元素；写入 M 个元素
+    # 读取 MN 个元素; 写入 M 个元素
     x_max = x.max(dim=1)[0]
-    # 读取 MN + M 个元素；写入 MN 个元素
+    # 读取 MN + M 个元素; 写入 MN 个元素
     z = x - x_max[:, None]
-    # 读取 MN 个元素；写入 MN 个元素
+    # 读取 MN 个元素; 写入 MN 个元素
     numerator = torch.exp(z)
-    # 读取 MN 个元素；写入 M 个元素
+    # 读取 MN 个元素; 写入 M 个元素
     denominator = numerator.sum(dim=1)
-    # 读取 MN + M 个元素；写入 MN 个元素
+    # 读取 MN + M 个元素; 写入 MN 个元素
     ret = numerator / denominator[:, None]
-    # 总共: 读取 5MN + 2M 个元素；写入 3MN + 2M 个元素
+    # 总共: 读取 5MN + 2M 个元素; 写入 3MN + 2M 个元素
     return ret
 
 # %%

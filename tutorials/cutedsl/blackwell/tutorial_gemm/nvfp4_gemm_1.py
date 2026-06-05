@@ -110,11 +110,14 @@ TMA multicast 是 TMA 的广播模式: 一次 GMEM 读取, 硬件自动将数据
 本示例 cluster_shape_mnk = (2, 1, 1), 即 M 维 2 个 CTA 组成一个 cluster.
 
 以 2x1 cluster 为例:
-  B:   被两个 CTA 共用, 且 2CTA SMEM 共享(DSMEM)使每个 CTA 只存一半 (128 行).
-       TMA 从 L2 读一次, 将各一半分别写入两个 CTA 的 SMEM, L2 流量减半.
-  SFB: 被两个 CTA 共用, 但不支持 2CTA SMEM 共享, 每个 CTA 仍需完整一份.
-       TMA multicast 将同一份完整 SFB 广播写入两个 CTA 的 SMEM, L2 流量减半.
-  A/SFA: 各不相同 → 无法 multicast, 各自从 L2 读取.
+  B:   被两个 CTA 共用, 但这里不是 TMA multicast 广播同一份 B.
+       2CTA MMA 使用 CopyBulkTensorTileG2SOp(CtaGroup.TWO), 将 B tile 分摊到两个 CTA 的 SMEM:
+       每个 CTA 只存一半 B, MMA 指令可通过 DSMEM 读取 peer CTA 的另一半.
+       相比两个独立 CTA 分别加载完整 B, B 的 L2 流量减半.
+  SFB: 被两个 CTA 共用, 但 scale factor 不走 B operand 的 2CTA SMEM 共享路径.
+       每个 CTA 仍需完整 SFB, 因此使用 TMA multicast 将同一份 SFB 广播到两个 CTA 的 SMEM,
+       SFB 的 L2 流量减半.
+  A/SFA: 两个 CTA 负责不同 M 行, 数据各不相同, 不做 multicast, 各自从 L2 读取.
 
 每 tile 的 L2 流量 = A 流量 / (N 维 cluster 数) + B 流量 / (M 维 cluster 数):
   无 multicast:  16KB + 32KB = 48KB
@@ -123,8 +126,8 @@ TMA multicast 是 TMA 的广播模式: 一次 GMEM 读取, 硬件自动将数据
 
 总结: 
 2CTA MMA 是硬件通过 DSMEM 让两个 CTA 共享 B 数据。每个 CTA 只需存 B 的一半到 SMEM, MMA 指令自动跨 CTA 读取另一半。
-而 TMA multicast 是一次从 L2 读取 B 数据，分发到两个 CTA 各自需要的那一半。因为 B 已经通过 2CTA 分半了，实际只对 SFB 进行了 multicast.
-2CTA 提供更强的延迟掩盖能力, TMA multicast 缩短数据就绪时间. 在延迟/内存带宽受限场景下需综合考虑.
+TMA multicast 在本例主要用于 SFB, 因为每个 CTA 都需要完整 SFB, multicast 可以避免从 L2 读两份相同 SFB。
+2CTA 提供更强的延迟掩盖能力, TMA multicast 缩短数据就绪时间, 在延迟/内存带宽受限场景下需综合考虑.
 
 
 运行此示例:
@@ -185,7 +188,7 @@ class Sm100BlockScaledDenseGemmKernel:
         )
 
         # SFB 不支持 2CTA SMEM 共享, 需要单独构建 CtaGroup.ONE 的 tiled_mma_sfb.
-        # SFB 是 (N, K/sf_vec_size)，但 CUTLASS 的 tiled_mma 是一个统一的抽象，因此需要传入 M 维.
+        # SFB 是 (N, K/sf_vec_size), 但 CUTLASS 的 tiled_mma 是一个统一的抽象, 因此需要传入 M 维.
         self.mma_inst_shape_sfb = (
             mma_tiler_mn[0] // (2 if self.use_2cta_instrs else 1), # 128
             mma_tiler_mn[1],  # 256 
@@ -222,7 +225,7 @@ class Sm100BlockScaledDenseGemmKernel:
             ),
         )
 
-        # 根据数据 tensor（A 或 B）的 shape，生成对应 scale factor tensor 的 GMEM layout.
+        # 根据数据 tensor(A 或 B)的 shape, 生成对应 scale factor tensor 的 GMEM layout.
         # ((Atom_M, Rest_M),(Atom_K, Rest_K),RestL): ((32, 4), (16, 4), L)
         sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(
             a_tensor.shape, sf_vec_size
@@ -344,7 +347,7 @@ class Sm100BlockScaledDenseGemmKernel:
         )
 
         # B 的 TMA load: CopyBulkTensorTileG2SOp(cta_group=<CtaGroup.TWO>)
-        # 不需要显式 multicast 广播，因为 CopyBulkTensorTileG2SOp(CtaGroup.TWO) 已经在两个 CTA 间分配了 B 数据
+        # 不需要显式 multicast 广播, 因为 CopyBulkTensorTileG2SOp(CtaGroup.TWO) 已经在两个 CTA 间分配了 B 数据
         b_op = sm100_utils.cluster_shape_to_tma_atom_B(
             cluster_shape_mnk[:2], tiled_mma.thr_id
         )
@@ -619,11 +622,11 @@ class Sm100BlockScaledDenseGemmKernel:
         gB_nkl = cute.local_tile(
             mB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
         )
-        # gSFA_mkl: ((32,4,2),(16,4,4),RestM,RestK,(1,RestL))
+        # ((32,4,2),(16,4,4),RestM,RestK,(1,RestL))
         gSFA_mkl = cute.local_tile(
             mSFA_mkl, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None)
         )
-        # gSFB_nkl: ((32,4,2),(16,4,4),RestN,RestK,(1,RestL))
+        # ((32,4,2),(16,4,4),RestN,RestK,(1,RestL))
         gSFB_nkl = cute.local_tile(
             mSFB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
         )
@@ -648,12 +651,6 @@ class Sm100BlockScaledDenseGemmKernel:
         tCgSFB = thr_mma_sfb.partition_B(gSFB_nkl)
         # (MMA, MMA_M, MMA_N, RestM, RestN, RestL) = ((128,256),1,1,?,?,?)  → 每 CTA 128x256
         tCgC = thr_mma.partition_C(gC_mnl)
-        if tidx == 0:
-            cute.printf("tCgA: {}", tCgA)
-            cute.printf("tCgB: {}", tCgB)
-            cute.printf("tCgSFA: {}", tCgSFA)
-            cute.printf("tCgSFB: {}", tCgSFB)
-            cute.printf("tCgC: {}", tCgC)
 
         #
         # 为 TMA load A/B/SFA/SFB 切分 global/shared tensor
@@ -779,7 +776,12 @@ class Sm100BlockScaledDenseGemmKernel:
         #
         # 为 SFA/SFB 的 S2T copy 做 partition
         #
-        # 构造 S2T CopyAtom
+        # 构造 S2T CopyAtom (SMEM → TMEM), 底层对应 tcgen05.cp PTX 指令
+        # 形状 4x32x128b 含义:
+        #   4    = 重复 4 次, 覆盖 4 个 K-block (MMA_K=4)
+        #   32   = TMEM 行粒度, tcgen05.cp 以 32 行为单位搬运
+        #   128b = 每行 16 bytes, 可容纳 16 个 f8 scale factor
+        # 单次 atom 搬运量: 4 x 32 x 16B = 2048B, 恰好等于 SFA 每 stage 的数据量
         copy_atom_s2t = cute.make_copy_atom(
             tcgen05.Cp4x32x128bOp(
                 tcgen05.CtaGroup.ONE
@@ -788,14 +790,18 @@ class Sm100BlockScaledDenseGemmKernel:
             ),
             sf_dtype,
         )
+        # filter_zeros 压缩 layout, 去除 stride=0 的退化维度, 让后续 copy 分区能正确计算实际数据量
         # (MMA, MMA_MN, MMA_K, STAGE) = ((((32,4),1),(1,4)),1,4,5) → filter 后的 SMEM SFA
         tCsSFA_compact = cute.filter_zeros(sSFA)
         # (MMA, MMA_MN, MMA_K) = ((((32,4),4),(1,4)),1,4) → filter 后的 TMEM SFA
         tCtSFA_compact = cute.filter_zeros(tCtSFA)
+        # 用 copy atom (4x32x128b) 铺满 TMEM SFA, 构造 TiledCopy
         tiled_copy_s2t_sfa = tcgen05.make_s2t_copy(copy_atom_s2t, tCtSFA_compact)
         thr_copy_s2t_sfa = tiled_copy_s2t_sfa.get_slice(0)
+        # 按 S2T copy atom 视角分区 SMEM 源 / TMEM 目标
         # ((ATOM_V, REST_V), Rest_Tiler, MMA_MN, MMA_K, STAGE)
         tCsSFA_compact_s2t_ = thr_copy_s2t_sfa.partition_S(tCsSFA_compact)
+        # 将 SMEM 分区转为 64-bit SMEM descriptor, tcgen05.cp 指令要求的源操作数格式
         # ((ATOM_V, REST_V), Rest_Tiler, MMA_MN, MMA_K, STAGE) = ((((32,1,1),4),1),1,1,4,5)
         tCsSFA_compact_s2t = tcgen05.get_s2t_smem_desc_tensor(
             tiled_copy_s2t_sfa, tCsSFA_compact_s2t_
@@ -803,6 +809,7 @@ class Sm100BlockScaledDenseGemmKernel:
         # ((ATOM_V, REST_V), Rest_Tiler, MMA_MN, MMA_K) = (((32,16,4),1),1,1,4)
         tCtSFA_compact_s2t = thr_copy_s2t_sfa.partition_D(tCtSFA_compact)
 
+        # SFB 同理, Rest_Tiler=2 因为 N=256 行需要两轮 atom 才能覆盖 (SFA 的 M=128 只需一轮)
         # (MMA, MMA_MN, MMA_K, STAGE) = ((((32,4),2),(1,4)),1,4,5) → filter 后的 SMEM SFB
         tCsSFB_compact = cute.filter_zeros(sSFB)
         # (MMA, MMA_MN, MMA_K) = ((((32,8),4),(1,4)),1,4) → filter 后的 TMEM SFB
@@ -815,7 +822,6 @@ class Sm100BlockScaledDenseGemmKernel:
         tCsSFB_compact_s2t = tcgen05.get_s2t_smem_desc_tensor(
             tiled_copy_s2t_sfb, tCsSFB_compact_s2t_
         )
-        # ((ATOM_V, REST_V), Rest_Tiler, MMA_MN, MMA_K)
         # ((ATOM_V, REST_V), Rest_Tiler, MMA_MN, MMA_K) = (((32,16,4),1),2,1,4)
         tCtSFB_compact_s2t = thr_copy_s2t_sfb.partition_D(tCtSFB_compact)
 

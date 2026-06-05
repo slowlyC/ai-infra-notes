@@ -20,7 +20,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.runtime import from_dlpack
 
 """
-首个教程 GEMM, 在 CuTeDSL 中演示简单 Dense GEMM  kernel 实现,仅用 200 余行代码实现.
+首个 GEMM 教程, 在 CuTeDSL 中演示简单 Dense GEMM  kernel 实现,仅用 200 余行代码实现.
 可作为起点, 帮助用户快速尝试针对其他问题规模可能出现的挑战的优化.
 
 在较大 tile 尺寸下, 该 Kernel 可在 8kx8kx8k 问题规模上达到很高的性能.
