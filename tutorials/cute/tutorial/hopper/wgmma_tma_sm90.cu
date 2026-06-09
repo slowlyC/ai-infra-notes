@@ -91,22 +91,22 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   CUTE_STATIC_ASSERT_V(congruent(select<0,1>(shape_MNK), dC));         // dC strides for shape MN
 
   //
-  // 完整张量与分块张量
+  // Full and Tiled Tensors
   //
 
-  // 表示完整张量
+  // Represent the full tensors
   auto [M, N, K] = shape_MNK;
   Tensor mA = tma_a.get_tma_tensor(make_shape(M,K));                   // (M,K) TMA Tensor
   Tensor mB = tma_b.get_tma_tensor(make_shape(N,K));                   // (N,K) TMA Tensor
   Tensor mC = make_tensor(make_gmem_ptr(C), make_shape(M,N), dC);      // (M,N)
 
-  // 获取本 thread block 对应的块
+  // Get the appropriate blocks for this thread block
   auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);              // (m,n,k)
   Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X,_1>{});  // (BLK_M,BLK_K,k)
   Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step< X,_1,_1>{});  // (BLK_N,BLK_K,k)
   Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1,_1, X>{});  // (BLK_M,BLK_N)
 
-  // 共享内存张量
+  // Shared memory tensors
   extern __shared__ char shared_memory[];
   using SharedStorage = SharedStorage<TA, TB, SmemLayoutA, SmemLayoutB>;
   SharedStorage& smem = *reinterpret_cast<SharedStorage*>(shared_memory);
@@ -114,10 +114,15 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   Tensor sB = make_tensor(make_smem_ptr(smem.B.begin()), SmemLayoutB{}); // (BLK_N,BLK_K,PIPE)
 
   //
-  // A、B tile 拷贝的分块
+  // Partition the copying of A and B tiles
   //
-  // 教程: 这是 TMA 分块，有 dedicated custom partitioner。Int<0>, Layout<_1> 表示 TMA 未组播。
-  //   group_modes<0,2> 将 (X,Y,Z) 变为 ((X,Y),Z)，TMA 负责 mode-0。tma_partition 根据 tma_x atom 与 multicast 信息重排、偏移 mode-0。
+  // TUTORIAL:
+  //   These are TMA partitionings, which have a dedicated custom partitioner.
+  //   The Int<0>, Layout<_1> indicates that the TMAs are not multicasted.
+  //     Any multicasting must be in conformance with tma_x constructed with make_tma_atom on host.
+  //   The group_modes<0,2> transforms the (X,Y,Z)-shaped tensors into ((X,Y),Z)-shaped tensors
+  //     with the understanding that the TMA is responsible for everything in mode-0.
+  //   The tma_partition reorders and offsets mode-0 according to the tma_x atom and the multicast info.
   //
 
   auto [tAgA, tAsA] = tma_partition(tma_a, Int<0>{}, Layout<_1>{},
@@ -126,7 +131,7 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   auto [tBgB, tBsB] = tma_partition(tma_b, Int<0>{}, Layout<_1>{},
                                     group_modes<0,2>(sB), group_modes<0,2>(gB));  // (TMA,k) and (TMA,PIPE)
 
-  // TMA 负责 tAsA、tBsB 的 mode-0 全部拷贝
+  // The TMA is responsible for copying everything in mode-0 of tAsA and tBsB
   constexpr int tma_transaction_bytes = sizeof(make_tensor_like(tensor<0>(tAsA)))
                                       + sizeof(make_tensor_like(tensor<0>(tBsB)));
 
@@ -141,7 +146,7 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   // Current tile index in gmem to read from
   int k_tile = 0;
 
-  // 初始化 Barrier
+  // Initialize Barriers
   int warp_idx = cutlass::canonical_warp_idx_sync();
   int lane_predicate = cute::elect_one_sync();
   uint64_t* producer_mbar = smem.tma_barrier;
@@ -156,10 +161,10 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
       ConsumerBarType::init(&consumer_mbar[pipe], 128);
     }
   }
-  // 确保所有 CTA 完成 barrier 初始化
+  // Ensure barrier init is complete on all CTAs
   cluster_sync();
 
-  // 为所有 pipe 发起异步加载
+  // Start async loads for all pipes
   CUTE_UNROLL
   for (int pipe = 0; pipe < K_PIPE_MAX; ++pipe)
   {
@@ -175,10 +180,13 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   }
 
   //
-  // 定义 A/B 分块与 C 累加器
+  // Define A/B partitioning and C accumulators
   //
-  // 教程: tCrA、tCrB 实际是 SMEM 视图构造的 MMA Descriptor 张量。MMA Descriptor 由 SMEM Layout 检查与验证自动生成。
-  //   MMA 直接从 SMEM 读取，fragment 为 descriptor 而非寄存器，主循环中无需 copy(tCsA, tCrA)。
+  // TUTORIAL:
+  //   The tCrA and tCrB are actually Tensors of MMA Descriptors constructed as views of SMEM.
+  //   The MMA Descriptor generation is automatic via inspection and validation of the SMEM Layouts.
+  //   Because the MMA reads directly from SMEM and the fragments are descriptors rather than registers,
+  //     there is no need for copy(tCsA, tCrA) in the mainloop.
   //
 
   ThrMMA thr_mma = mma.get_thread_slice(threadIdx.x);
@@ -186,49 +194,53 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   Tensor tCsB = thr_mma.partition_B(sB);                               // (MMA,MMA_N,MMA_K,PIPE)
   Tensor tCgC = thr_mma.partition_C(gC);                               // (MMA,MMA_M,MMA_N)
 
-  // 分配并清空累加器
+  // Allocate accumulators and clear them
   Tensor tCrC = thr_mma.make_fragment_C(tCgC);                         // (MMA,MMA_M,MMA_N)
   clear(tCrC);
 
-  // 分配 "fragment"
+  // Allocate "fragments"
   Tensor tCrA = thr_mma.make_fragment_A(tCsA);                         // (MMA,MMA_M,MMA_K,PIPE)
   Tensor tCrB = thr_mma.make_fragment_B(tCsB);                         // (MMA,MMA_N,MMA_K,PIPE)
 
   //
-  // 流水线主循环
+  // PIPELINED MAIN LOOP
   //
-  // 教程: 与 SM70/SM80 的 stage 与指令交错不同，SM90 主循环依赖 TMA 与 MMA 的显式生产者-消费者同步。
-  //   更高级的流水线与 warp 专业化策略见 CUTLASS mainloop。
+  // TUTORIAL:
+  //   Rather than interleaving the stages and instructions like in SM70 and SM80,
+  //     the SM90 mainloops rely on explicit producer-consumer synchronization
+  //     on the purely async instructions TMA and MMA.
+  //   More advanced pipeline and warp-specialization strategies are available in CUTLASS mainloops.
   //
 
-  // PipelineState 为循环 pipe 索引 [.index()] 与 pipe 相位 [.phase()]，每经过 K_PIPE_MAX 翻转一次。
-  auto write_state = cutlass::PipelineState<K_PIPE_MAX>();             // TMA 写入
-  auto read_state  = cutlass::PipelineState<K_PIPE_MAX>();             // MMA 读取
+  // A PipelineState is a circular pipe index [.index()] and a pipe phase [.phase()]
+  //   that flips each cycle through K_PIPE_MAX.
+  auto write_state = cutlass::PipelineState<K_PIPE_MAX>();             // TMA writes
+  auto read_state  = cutlass::PipelineState<K_PIPE_MAX>();             // MMA  reads
 
   CUTE_NO_UNROLL
   while (k_tile_count > -K_PIPE_MAX)
   {
-    // 等待 Producer 完成
+    // Wait for Producer to complete
     int read_pipe = read_state.index();
     ProducerBarType::wait(&producer_mbar[read_pipe], read_state.phase());
 
-    // MMA 覆盖 1 个 K_TILE
+    // MMAs to cover 1 K_TILE
     warpgroup_arrive();
     gemm(mma, tCrA(_,_,_,read_pipe), tCrB(_,_,_,read_pipe), tCrC);     // (V,M) x (V,N) => (V,M,N)
     warpgroup_commit_batch();
 
-    // 等待 K_TILE 内所有 MMA 完成
+    // Wait for all MMAs in a K_TILE to complete
     warpgroup_wait<0>();
 
-    // 通知消费完成
+    // Notify that consumption is done
     ConsumerBarType::arrive(&consumer_mbar[read_pipe]);
     ++read_state;
 
-    // 仅在有更多 tile 可拉取时发起新 TMA 拷贝
+    // Only issue new TMA copies if there are more tiles to fetch
     if ((warp_idx == 0) && lane_predicate && (k_tile_count > 0))
     {
       int pipe = write_state.index();
-      // 等待 Consumer 消费完成
+      // Wait for Consumer to complete consumption
       ConsumerBarType::wait(&consumer_mbar[pipe], write_state.phase());
       // Set expected Tx Bytes after each reset / init
       ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe], tma_transaction_bytes);
@@ -241,13 +253,13 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   }
 
   //
-  // 收尾 (无 predicated)
+  // Epilogue (unpredicated)
   //
 
   axpby(alpha, tCrC, beta, tCgC);
 }
 
-// 配置 NT GEMM 参数
+// Setup params for an NT GEMM
 template <class TA, class TB, class TC,
           class Alpha, class Beta>
 void
@@ -259,45 +271,45 @@ gemm_nt(int m, int n, int k,
         TC      * C, int ldC,
         cudaStream_t stream = 0)
 {
-  // 定义 shape (动态)
+  // Define shapes (dynamic)
   auto M = int(m);
   auto N = int(n);
   auto K = int(k);
   auto prob_shape = make_shape(M, N, K);                     // (M, N, K)
 
-  // 定义 TN 步长 (混合)
+  // Define TN strides (mixed)
   auto dA = make_stride(Int<1>{}, ldA);                      // (dM, dK)
   auto dB = make_stride(Int<1>{}, ldB);                      // (dN, dK)
   auto dC = make_stride(Int<1>{}, ldC);                      // (dM, dN)
 
-  // 定义 CTA tile 尺寸 (静态)
+  // Define CTA tile sizes (static)
   auto bM = Int<128>{};
   auto bN = Int<128>{};
   auto bK = Int< 64>{};
   auto cta_tiler = make_shape(bM, bN, bK);                   // (BLK_M, BLK_N, BLK_K)
   auto bP = Int<  3>{};  // Pipeline
 
-  // 定义 SMEM layout (静态)
+  // Define the smem layouts (static)
   auto sA = tile_to_shape(GMMA::Layout_MN_SW128_Atom<TA>{}, make_shape(bM,bK,bP));
   auto sB = tile_to_shape(GMMA::Layout_MN_SW128_Atom<TB>{}, make_shape(bN,bK,bP));
 
-  // 定义 MMA
+  // Define the MMA
   TiledMMA tiled_mma = make_tiled_mma(SM90_64x64x16_F16F16F16_SS<GMMA::Major::MN,GMMA::Major::MN>{});
 
-  // 定义 TMA
-  // 创建 TMA 检查用的全局内存张量
+  // Define the TMAs
+  // Create Global memory tensors for TMA inspection
   Tensor mA = make_tensor(A, make_shape(M,K), dA);
   Tensor mB = make_tensor(B, make_shape(N,K), dB);
 
-  // 用期望的源/目标拷贝操作创建 TMA Atom
+  // Create TMA Atoms with the desired copy operation on the source and destination
   Copy_Atom tmaA = make_tma_atom(SM90_TMA_LOAD{}, mA, sA(_,_,0), make_shape(bM,bK));
   Copy_Atom tmaB = make_tma_atom(SM90_TMA_LOAD{}, mB, sB(_,_,0), make_shape(bN,bK));
 
   //
-  // 配置与启动
+  // Setup and Launch
   //
 
-  // 启动参数配置
+  // Launch parameter setup
   int smem_size = int(sizeof(SharedStorage<TA, TB, decltype(sA), decltype(sB)>));
   dim3 dimBlock(size(tiled_mma));
   dim3 dimCluster(2, 1, 1);
@@ -331,7 +343,7 @@ gemm_nt(int m, int n, int k,
   }
 }
 
-// 配置 TN GEMM 参数
+// Setup params for a TN GEMM
 template <class TA, class TB, class TC,
           class Alpha, class Beta>
 void
@@ -343,45 +355,45 @@ gemm_tn(int m, int n, int k,
         TC      * C, int ldC,
         cudaStream_t stream = 0)
 {
-  // 定义 shape (动态)
+  // Define shapes (dynamic)
   auto M = int(m);
   auto N = int(n);
   auto K = int(k);
   auto prob_shape = make_shape(M, N, K);                     // (M, N, K)
 
-  // 定义 TN 步长 (混合)
+  // Define TN strides (mixed)
   auto dA = make_stride(ldA, Int<1>{});                      // (dM, dK)
   auto dB = make_stride(ldB, Int<1>{});                      // (dN, dK)
   auto dC = make_stride(Int<1>{}, ldC);                      // (dM, dN)
 
-  // 定义 CTA tile 尺寸 (静态)
+  // Define CTA tile sizes (static)
   auto bM = Int<128>{};
   auto bN = Int<128>{};
   auto bK = Int< 64>{};
   auto cta_tiler = make_shape(bM, bN, bK);                   // (BLK_M, BLK_N, BLK_K)
   auto bP = Int<3>{};  // Pipeline
 
-  // 定义 SMEM layout (静态)
+  // Define the smem layouts (static)
   auto sA = tile_to_shape(GMMA::Layout_K_SW128_Atom<TA>{}, make_shape(bM,bK,bP));
   auto sB = tile_to_shape(GMMA::Layout_K_SW128_Atom<TB>{}, make_shape(bN,bK,bP));
 
-  // 定义 MMA
+  // Define the MMA
   TiledMMA tiled_mma = make_tiled_mma(SM90_64x64x16_F16F16F16_SS<GMMA::Major::K,GMMA::Major::K>{});
 
-  // 定义 TMA
-  // 创建 TMA 检查用的全局内存张量
+  // Define the TMAs
+  // Create Global memory tensors for TMA inspection
   Tensor mA = make_tensor(A, make_shape(M,K), dA);
   Tensor mB = make_tensor(B, make_shape(N,K), dB);
 
-  // 用期望的源/目标拷贝操作创建 TMA Atom
+  // Create TMA Atoms with the desired copy operation on the source and destination
   Copy_Atom tmaA = make_tma_atom(SM90_TMA_LOAD{}, mA, sA(_,_,0), make_shape(bM,bK));
   Copy_Atom tmaB = make_tma_atom(SM90_TMA_LOAD{}, mB, sB(_,_,0), make_shape(bN,bK));
 
   //
-  // 配置与启动
+  // Setup and Launch
   //
 
-  // 启动参数配置
+  // Launch parameter setup
   dim3 dimBlock(size(tiled_mma));
   dim3 dimCluster(2, 1, 1);
   dim3 dimGrid(round_up(size(ceil_div(m, bM)), dimCluster.x),
@@ -484,7 +496,7 @@ int main(int argc, char** argv)
   thrust::host_vector<TB> h_B(n*k);
   thrust::host_vector<TC> h_C(m*n);
 
-  // 初始化张量
+  // Initialize the tensors
   for (int j = 0; j < m*k; ++j) h_A[j] = TA(int((rand() % 2) ? 1 : -1));
   for (int j = 0; j < n*k; ++j) h_B[j] = TB(int((rand() % 2) ? 1 : -1));
   for (int j = 0; j < m*n; ++j) h_C[j] = TC(0);
@@ -516,7 +528,7 @@ int main(int argc, char** argv)
     assert(false);
   }
 
-  // 运行一次
+  // Run once
   d_C = h_C;
   gemm(transA, transB, m, n, k,
        alpha,
@@ -527,7 +539,7 @@ int main(int argc, char** argv)
   CUTE_CHECK_LAST();
   thrust::host_vector<TC> cute_result = d_C;
 
-  // 计时迭代
+  // Timing iterations
   timer.start();
   for (int i = 0; i < timing_iterations; ++i) {
     gemm(transA, transB, m, n, k,

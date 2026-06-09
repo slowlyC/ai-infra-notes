@@ -32,15 +32,15 @@
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 //
 //                             CuTe SM100 编程教程
-// This tutorial series demonstrates CuTe Blackwell capabilities that are frequently used
-// throughout CUTLASS. The goal is to familiarize developers with CuTe SM100 interfaces.
+// 本教程系列演示 CUTLASS 中常用的 CuTe Blackwell 能力.
+// 目标是让开发者熟悉 CuTe SM100 接口.
 //
-// The tutorial series is split into five stages:
-// * 01_mma_sm100.cu: Simple Blackwell SM100 GEMM using a tcgen05.mma instruction.
-// * 02_mma_tma_sm100.cu: Simple Blackwell SM100 GEMM using tcgen05.mma and TMA instructions.
-// * 03_mma_tma_multicast_sm100.cu: Blackwell SM100 GEMM using tcgen05.mma and Multicast TMA.
-// * 04_mma_tma_2sm_sm100.cu: Blackwell SM100 GEMM with 2SM tcgen05.mma and 2SM Multicast TMA.
-// * 05_mma_tma_epi_sm100.cu: Blackwell SM100 GEMM with 2SM tcgen05.mma, 2SM TMA mainloop, and TMA epilogue.
+// 教程系列分为五个阶段:
+// * 01_mma_sm100.cu: 使用 tcgen05.mma 指令的简单 Blackwell SM100 GEMM.
+// * 02_mma_tma_sm100.cu: 使用 tcgen05.mma 和 TMA 指令的简单 Blackwell SM100 GEMM.
+// * 03_mma_tma_multicast_sm100.cu: 使用 tcgen05.mma 和 Multicast TMA 的 Blackwell SM100 GEMM.
+// * 04_mma_tma_2sm_sm100.cu: 使用 2SM tcgen05.mma 和 2SM Multicast TMA 的 Blackwell SM100 GEMM.
+// * 05_mma_tma_epi_sm100.cu: 使用 2SM tcgen05.mma, 2SM TMA mainloop 和 TMA epilogue 的 Blackwell SM100 GEMM.
 //
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -51,77 +51,78 @@
 #include <thrust/host_vector.h>
 #include <thrust/device_vector.h>
 
-// Cutlass 头文件
+// CUTLASS 头文件
 #include <cutlass/half.h>                       // F16 数据类型
 #include <cutlass/util/print_error.hpp>
 #include <cutlass/arch/barrier.h>
 #include <cutlass/cluster_launch.hpp>
 
 // CuTe 头文件
-#include <cute/tensor.hpp>                      // CuTe 张量实现
-#include <cute/arch/cluster_sm90.hpp>           // 查询 cluster 启动详情的 CuTe 函数
-#include <cute/numeric/integral_constant.hpp>   // 编译时常量如 _1, _256 等
-#include <cute/algorithm/cooperative_copy.hpp>  // 自动向量化拷贝操作
-#include <cute/arch/tmem_allocator_sm100.hpp>   // SM100 的 TMEM 分配器
+#include <cute/tensor.hpp>                      // CuTe tensor 实现
+#include <cute/arch/cluster_sm90.hpp>           // 查询 cluster launch 细节的 CuTe 函数
+#include <cute/numeric/integral_constant.hpp>   // _1, _256 等编译期常量
+#include <cute/algorithm/cooperative_copy.hpp>  // 自动向量化 copy 操作
+#include <cute/arch/tmem_allocator_sm100.hpp>   // SM100 TMEM 分配器
 
-// 教程辅助
+// 教程辅助函数
 #include "example_utils.hpp"
 
 using namespace cute;
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 //
-// Tutorial 05: Blackwell SM100 GEMM with 2SM tcgen05.mma, 2SM TMA mainloop, and TMA epilogue
+// 教程 05: 使用 2SM tcgen05.mma, 2SM TMA mainloop 和 TMA epilogue 的 Blackwell SM100 GEMM
 //
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-// We will implement a GEMM operation: D (f32) = beta * C (F32) + alpha * A (F16) * B (F16) where:
-// - Matrix A is MxK, K-major (BLAS transpose T, row-major)
-// - Matrix B is NxK, K-major (BLAS transpose N, column-major)
-// - Matrices C and D are MxN, N-major (BLAS row-major)
+// 这里实现 GEMM: D (f32) = beta * C (F32) + alpha * A (F16) * B (F16), 其中:
+// - 矩阵 A 为 MxK, K-major (BLAS transpose T, row-major)
+// - 矩阵 B 为 NxK, K-major (BLAS transpose N, column-major)
+// - 矩阵 C 和 D 为 MxN, N-major (BLAS row-major)
 //
-// 相对 04 的扩展: 在收尾阶段使用 TMA 指令
+// 相对 04_mma_tma_2sm_sm100.cu, 本教程新增:
+// 1. 演示在 epilogue 中使用 TMA 指令
 //
-// This GEMM kernel will perform the following steps:
-// 1. Load A and B matrices from GMEM to SMEM using Multicasted TMA.2SM load operations.
-// 2. Perform matrix multiply-accumulate (MMA) operations using 2SM tcgen05.mma instruction.
-// 3. Load completed accumulator from tensor memory (TMEM) to registers (RMEM) using tcgen05.ld.
-// 4. Read C matrix from global memory (GMEM) to shared memory (SMEM) with TMA.
-// 5. Apply alpha and beta scaling to the MMA accumulator and C matrix.
-// 6. Store D matrix from shared memory (SMEM) to global memory (GMEM) with TMA.
+// 本 GEMM kernel 执行以下步骤:
+// 1. 使用 Multicasted TMA.2SM load 操作将 A 和 B 矩阵从 GMEM 加载到 SMEM.
+// 2. 使用 2SM tcgen05.mma 指令执行 matrix multiply-accumulate (MMA).
+// 3. 使用 tcgen05.ld 将完成的累加器从 tensor memory (TMEM) 加载到 registers (RMEM).
+// 4. 使用 TMA 将 C 矩阵从 global memory (GMEM) 读入 shared memory (SMEM).
+// 5. 对 MMA 累加器和 C 矩阵应用 alpha 和 beta 缩放.
+// 6. 使用 TMA 将 D 矩阵从 shared memory (SMEM) 存储到 global memory (GMEM).
 //
-// SM100 2SM tcgen05.mma instructions operate as follows:
-// - Mma is launched by only one SM
-//    With 2SM MMA instructions, only 1 of the 2 CTAs collaborating on MMA executes the instruction.
-//    We call the collaborating CTAs, peer CTAs. And the CTA executing the MMA instruction is called leader CTA.
-// - Read matrix A from SMEM or TMEM
-// - Read matrix B from SMEM
-// - Write accumulator to TMEM
-// The accumulator in TMEM must then be loaded to registers before writing back to GMEM.
+// SM100 2SM tcgen05.mma 指令的行为如下:
+// - MMA 只由一个 SM 发起.
+//   对 2SM MMA 指令, 两个协作 CTA 中只有一个 CTA 执行 MMA 指令.
+//   两个协作 CTA 称为 peer CTA, 执行 MMA 指令的 CTA 称为 leader CTA.
+// - 从 SMEM 或 TMEM 读取矩阵 A
+// - 从 SMEM 读取矩阵 B
+// - 将累加器写入 TMEM
+// TMEM 中的累加器必须先加载到寄存器, 然后才能写回 GMEM.
 //
-// The tcgen05.mma instruction requires an Instruction Descriptor that encodes A, B, and Accumulator types
-//   and the MMA's M and N dimensions.
-// The A and B matrices that are read from SMEM need to be provided to MMA instructions as SMEM Descriptors.
-//   These are the A and B fragments of the tcgen05.mma in CuTe terminology.
-// CuTe provides these descriptors transparently in the instruction and fragments, shown in this tutorial.
+// tcgen05.mma 指令需要一个 Instruction Descriptor, 用于编码 A, B 和累加器类型,
+//   以及 MMA 的 M 和 N 维度.
+// 从 SMEM 读取的 A 和 B 矩阵需要以 SMEM Descriptor 的形式提供给 MMA 指令.
+//   在 CuTe 术语中, 它们是 tcgen05.mma 的 A 和 B fragment.
+// 本教程会展示 CuTe 如何在指令和 fragment 中透明地提供这些 descriptor.
 //
-// The MMA details:
-// We use the tcgen05.mma.f16 instruction (F16xF16 = F32) that performs a 256x256x16 MMA
-// operation. F32 accumulator type is chosen since both C and D matrices use F32.
-// This example uses F16xF16 = F32 MMA where:
-// TypeA = cutlass::half_t;  // MMA A Data Type
-// TypeB = cutlass::half_t;  // MMA B Data Type
-// TypeC = float;            // MMA C Data Type
-// TypeD = float;            // MMA D Data Type
-// TypeAccumulator = float;  // Both TypeC and TypeD are float, so we use float accumulator type
+// MMA 细节:
+// 本例使用 tcgen05.mma.f16 指令 (F16xF16 = F32), 执行 256x256x16 MMA.
+// 因为 C 和 D 矩阵都使用 F32, 所以累加器类型也选择 F32.
+// 本例的 F16xF16 = F32 MMA 类型如下:
+// TypeA = cutlass::half_t;  // MMA A 数据类型
+// TypeB = cutlass::half_t;  // MMA B 数据类型
+// TypeC = float;            // MMA C 数据类型
+// TypeD = float;            // MMA D 数据类型
+// TypeAccumulator = float;  // TypeC 和 TypeD 都是 float, 因此使用 float 累加器
 
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
 
-// A、B、C、D 矩阵的共享内存缓冲。
-template <class TypeA,           // Tensor A data type
-          class TypeB,           // Tensor B data type
-          class TypeC,           // Tensor C data type
-          class TypeD,           // Tensor D data type
+// A, B, C, D 矩阵的共享内存缓冲区.
+template <class TypeA,           // Tensor A 数据类型
+          class TypeB,           // Tensor B 数据类型
+          class TypeC,           // Tensor C 数据类型
+          class TypeD,           // Tensor D 数据类型
           class ASmemLayout,     // (MmaA, NumMma_M, NumMma_K, ...)
           class BSmemLayout,     // (MmaB, NumMma_N, NumMma_K, ...)
           class CSmemLayout,     // EpiTile_M, EpiTile_N
@@ -140,7 +141,7 @@ struct SharedStorage
   alignas(16) cute::uint64_t mma_barrier;  // 跟踪 SMEM 上 MMA 计算的 barrier
   alignas(16) cute::uint64_t tma_barrier;  // 跟踪 TMA 到 SMEM 传输的 barrier
 
-  alignas(16) cute::uint32_t tmem_base_ptr; // TMEM 分配基址
+  alignas(16) cute::uint32_t tmem_base_ptr; // TMEM 分配的基址指针
 
   CUTE_DEVICE constexpr auto tensor_sA() { return make_tensor(make_smem_ptr(tensors.mainloop.A.begin()), ASmemLayout{}); }
   CUTE_DEVICE constexpr auto tensor_sB() { return make_tensor(make_smem_ptr(tensors.mainloop.B.begin()), BSmemLayout{}); }
@@ -148,7 +149,7 @@ struct SharedStorage
   CUTE_DEVICE constexpr auto tensor_sD() { return make_tensor(make_smem_ptr(tensors.D.begin()), DSmemLayout{}); }
 };
 
-// The device kernel
+// 设备端 kernel
 template <class SharedStorage,
           class ATensor, class BTensor, class CTensor, class DTensor,
           class MmaTiler_MNK, class EpiTiler_MN, class TiledMMA, class ClusterShape_MNK,
@@ -170,25 +171,24 @@ gemm_device(ATensor mA,                      // (Gemm_M, Gemm_K)
             CUTE_GRID_CONSTANT TmaAtomD const tma_atom_D,
             Alpha alpha, Beta beta)
 {
-  // 步骤 1: 序章。
+  // 步骤 1: Prologue.
 
-  // The CTA layout within the Cluster: (V,M,N,K) -> CTA idx
+  // Cluster 内的 CTA layout: (V,M,N,K) -> CTA idx
   Layout cluster_layout_vmnk = tiled_divide(make_layout(cluster_shape),
                                             make_tile(typename TiledMMA::AtomThrID{}));
 
-  // Construct the MMA grid coordinate from the CTA grid coordinate
-  auto mma_coord_vmnk = make_coord(blockIdx.x % size<0>(cluster_layout_vmnk), // Peer CTA coordinate
-                                   blockIdx.x / size<0>(cluster_layout_vmnk), //    MMA-M coordinate
-                                   blockIdx.y,                                //    MMA-N coordinate
-                                   _);                                        //    MMA-K coordinate
+  // 根据 CTA grid 坐标构造 MMA grid 坐标
+  auto mma_coord_vmnk = make_coord(blockIdx.x % size<0>(cluster_layout_vmnk), // Peer CTA 坐标
+                                   blockIdx.x / size<0>(cluster_layout_vmnk), //    MMA-M 坐标
+                                   blockIdx.y,                                //    MMA-N 坐标
+                                   _);                                        //    MMA-K 坐标
 
-  // 用 mma_tiler 和 mma_coord 对 GMEM 张量分块，得到本 mma tile 处理的切片
-  //   by this mma tile.
-  // CuTe provides local_tile partitioning function. local_tile accepts 4 parameters:
-  //   * Tensor to partition
-  //   * Tiler to use for partitioning
-  //   * Coordinate to use for slicing the partitioned tensor
-  //   * Projection to ignore unwanted modes of the Tiler and Coordinate
+  // 使用 mma_tiler 和 mma_coord 对 GMEM tensor 分块, 得到本 mma tile 处理的切片.
+  // CuTe 提供 local_tile 分块函数. local_tile 接受 4 个参数:
+  //   * 要分块的 tensor
+  //   * 用于分块的 tiler
+  //   * 用于切分分块后 tensor 的坐标
+  //   * projection, 用于忽略 Tiler 和 Coordinate 中不需要的 mode
   auto mma_coord = select<1,2,3>(mma_coord_vmnk);
   Tensor gA = local_tile(mA, mma_tiler, mma_coord, Step<_1, X,_1>{});  // (MmaTile_M, MmaTile_K, Tiles_K)
   Tensor gB = local_tile(mB, mma_tiler, mma_coord, Step< X,_1,_1>{});  // (MmaTile_N, MmaTile_K, Tiles_K)
@@ -207,22 +207,22 @@ gemm_device(ATensor mA,                      // (Gemm_M, Gemm_K)
     print("gD:\t"); print(gD); print("\n");   // gD:   gmem_ptr[32b](GMEM_ADDR_D + offset_for_mma_tile) o (_128,_256):(256,_1)
   } __syncthreads();
 
-  // The SMEM tensors
+  // SMEM tensor
 
-  // Allocate SMEM
+  // 分配 SMEM
   extern __shared__ char shared_memory[];
   SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(shared_memory);
 
-  // 表示 A、B 的 SMEM 缓冲
+  // 表示 A 和 B 的 SMEM 缓冲区
   Tensor tCsA = shared_storage.tensor_sA();         // (MmaA, NumMma_M, NumMma_K, Tiles_K)
   Tensor tCsB = shared_storage.tensor_sB();         // (MmaB, NumMma_M, NumMma_K, Tiles_K)
 
   //
-  // Mma partitioning for A and B
+  // A 和 B 的 MMA 分块
   //
 
   auto mma_v = get<0>(mma_coord_vmnk);
-  ThrMMA cta_mma = tiled_mma.get_slice(mma_v);   // Use Peer CTA coordinate
+  ThrMMA cta_mma = tiled_mma.get_slice(mma_v);   // 使用 Peer CTA 坐标
   Tensor tCgA = cta_mma.partition_A(gA);         // (MmaA, NumMma_M, NumMma_K, Tiles_K)
   Tensor tCgB = cta_mma.partition_B(gB);         // (MmaB, NumMma_N, NumMma_K, Tiles_K)
   Tensor tCgC = cta_mma.partition_C(gC);         // (MmaC, NumMma_M, NumMma_N)
@@ -235,18 +235,18 @@ gemm_device(ATensor mA,                      // (Gemm_M, Gemm_K)
     print("tCgD:\t"); print(tCgD); print("\n");  // tCgD:   gmem_ptr[32b](GMEM_ADDR_D + offset_for_mma_tile + offset_for_mma) o ((_128,_256),_1,_1):((256,_1),_0,_0)
   } __syncthreads();
 
-  // MMA Fragment Allocation
-  // We allocate "fragments" which are SMEM descriptors that serve as inputs to cute::gemm operations.
-  // For tcgen05.mma operations:
-  // - Matrices A and B are sourced from SMEM
-  // - tCrA and tCrB provide descriptor views of tCsA and tCsB respectively
-  // - The first mode of each descriptor represents the SMEM for a single MMA operation
+  // MMA Fragment 分配
+  // 这里分配 "fragment", 它们是作为 cute::gemm 输入的 SMEM descriptor.
+  // 对 tcgen05.mma 操作:
+  // - 矩阵 A 和 B 来自 SMEM
+  // - tCrA 和 tCrB 分别提供 tCsA 和 tCsB 的 descriptor 视图
+  // - 每个 descriptor 的第一个 mode 表示单次 MMA 操作使用的 SMEM
   Tensor tCrA = cta_mma.make_fragment_A(tCsA);      // (MmaA, NumMma_M, NumMma_K, Tiles_K)
   Tensor tCrB = cta_mma.make_fragment_B(tCsB);      // (MmaB, NumMma_M, NumMma_K, Tiles_K)
 
-  // TMEM Allocation
-  // On SM100 architecture, accumulators are stored exclusively in tensor memory (TMEM).
-  // ThrMma's make_fragment_C() creates a TMEM tensor with the appropriate layout for the accumulator.
+  // TMEM 分配
+  // 在 SM100 架构上, 累加器只存放在 tensor memory (TMEM) 中.
+  // ThrMma 的 make_fragment_C() 会创建一个 layout 适合累加器的 TMEM tensor.
   Tensor tCtAcc = cta_mma.make_fragment_C(tCgC);    // (MmaC, NumMma_M, NumMma_N)
 
   uint32_t elect_one_thr  = cute::elect_one_sync();
@@ -258,7 +258,7 @@ gemm_device(ATensor mA,                      // (Gemm_M, Gemm_K)
   if (elect_one_warp) {
     tmem_allocator.allocate(TmemAllocator::Sm100TmemCapacityColumns, &shared_storage.tmem_base_ptr);
   }
-  __syncthreads(); // 等待 warp0 完成 TMEM 分配
+  __syncthreads(); // 等待所有线程, 直到 warp0 完成 TMEM 分配
   tCtAcc.data() = shared_storage.tmem_base_ptr;
 
   if (thread0()) {
@@ -269,49 +269,49 @@ gemm_device(ATensor mA,                      // (Gemm_M, Gemm_K)
     print("tCtAcc:\t"); print(tCtAcc); print("\n"); // tCtAcc: tmem_[32b](TMEM_ADDR) o ((_128,_256),_1,_1):((_65536,_1),_0,_0)
   } __syncthreads();
 
-  // TMA Setup
+  // TMA 设置
   //
-  //   These are TMA partitionings, which have a dedicated custom partitioner.
-  //   In this example, the TMA multicasts the loads across multiple CTAs.
-  //   Loads of A are multicasted along the N dimension of the cluster_shape_VMNK and
-  //   Loads of B are multicasted along the M dimension of the cluster_shape_VMNK.
-  //      Any multicasting must be in conformance with tma_x constructed with make_tma_atom on host.
-  //   For A tensor: The group_modes<0,3> transforms the (MmaA, NumMma_M, NumMma_K, Tiles_K)-shaped tensor
-  //      into ((MmaA, NumMma_M, NumMma_K), Tiles_K). The partitioning only pays attention to mode-0, the MMA Tile MK.
-  //   For B tensor: The group_modes<0,3> transforms the (MmaB, NumMma_M, NumMma_K, Tiles_K)-shaped tensor
-  //      into ((MmaB, NumMma_M, NumMma_K), Tiles_K). The partitioning only pays attention to mode-0, the MMA Tile NK.
-  //   Simply put, the TMA will be responsible for everything in mode-0 with a single call to cute::copy.
-  //   The tma_partition reorders and offsets mode-0 according to the tma_x atom and the multicast info.
+  //   这里是 TMA 分块, 它们使用专用的自定义 partitioner.
+  //   本例中, TMA 会把 load multicast 到多个 CTA.
+  //   A 的 load 沿 cluster_shape_VMNK 的 N 维 multicast,
+  //   B 的 load 沿 cluster_shape_VMNK 的 M 维 multicast.
+  //      所有 multicast 都必须与 host 端通过 make_tma_atom 构造的 tma_x 保持一致.
+  //   对 A tensor: group_modes<0,3> 将形状为 (MmaA, NumMma_M, NumMma_K, Tiles_K) 的 tensor
+  //      转换为 ((MmaA, NumMma_M, NumMma_K), Tiles_K). 分块只关注 mode-0, 即 MMA Tile MK.
+  //   对 B tensor: group_modes<0,3> 将形状为 (MmaB, NumMma_M, NumMma_K, Tiles_K) 的 tensor
+  //      转换为 ((MmaB, NumMma_M, NumMma_K), Tiles_K). 分块只关注 mode-0, 即 MMA Tile NK.
+  //   简单说, TMA 会通过一次 cute::copy 负责 mode-0 中的所有内容.
+  //   tma_partition 会根据 tma_x atom 和 multicast 信息对 mode-0 重排并添加 offset.
 
-  // Each CTA with the same m-coord will load a portion of A
-  // Each CTA with the same n-coord will load a portion of B
-  // Computation of the multicast masks must take into account the Peer CTA for TMA.2SM
+  // m 坐标相同的每个 CTA 都会加载 A 的一部分
+  // n 坐标相同的每个 CTA 都会加载 B 的一部分
+  // 计算 multicast mask 时必须考虑 TMA.2SM 的 Peer CTA
 
-  // Construct the CTA-in-Cluster coordinate for multicasting
+  // 构造用于 multicast 的 CTA-in-Cluster 坐标
   auto cta_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(int(cute::block_rank_in_cluster()));
   auto elect_one_cta  = get<0>(cta_in_cluster_coord_vmnk) == Int<0>{};
 
-  // Project the cluster_layout for tma_A along the N-modes
+  // 沿 N-mode 投影 tma_A 的 cluster_layout
   auto [tAgA, tAsA] = tma_partition(tma_atom_A,
-                                    get<2>(cta_in_cluster_coord_vmnk),          // The CTA coordinate along N mode of the cluster
-                                    make_layout(size<2>(cluster_layout_vmnk)),  // The CTA layout along N mode of the cluster
+                                    get<2>(cta_in_cluster_coord_vmnk),          // CTA 在 cluster N mode 上的坐标
+                                    make_layout(size<2>(cluster_layout_vmnk)),  // CTA 在 cluster N mode 上的 layout
                                     group_modes<0,3>(tCsA), group_modes<0,3>(tCgA));
 
-  // Project the cluster_layout for tma_B along the M-modes
+  // 沿 M-mode 投影 tma_B 的 cluster_layout
   auto [tBgB, tBsB] = tma_partition(tma_atom_B,
-                                    get<1>(cta_in_cluster_coord_vmnk),          // The CTA coordinate along M mode of the cluster
-                                    make_layout(size<1>(cluster_layout_vmnk)),  // The CTA layout along M mode of the cluster
+                                    get<1>(cta_in_cluster_coord_vmnk),          // CTA 在 cluster M mode 上的坐标
+                                    make_layout(size<1>(cluster_layout_vmnk)),  // CTA 在 cluster M mode 上的 layout
                                     group_modes<0,3>(tCsB), group_modes<0,3>(tCgB));
 
-  // Project the cluster_layout and cta_coord along the N-mode to determine the multicast mask for A
+  // 沿 N-mode 投影 cluster_layout 和 cta_coord, 得到 A 的 multicast mask
   uint16_t tma_mcast_mask_a = create_tma_multicast_mask<2>(cluster_layout_vmnk, cta_in_cluster_coord_vmnk);
-  // Project the cluster_layout and cta_coord along the M-mode to determine the multicast mask for B
+  // 沿 M-mode 投影 cluster_layout 和 cta_coord, 得到 B 的 multicast mask
   uint16_t tma_mcast_mask_b = create_tma_multicast_mask<1>(cluster_layout_vmnk, cta_in_cluster_coord_vmnk);
-  // Project the cluster_layout and cta_coord along the VM + VN-modes to determine the multicast mask for C
+  // 沿 VM + VN mode 投影 cluster_layout 和 cta_coord, 得到 C 的 multicast mask
   uint16_t mma_mcast_mask_c = create_tma_multicast_mask<0,1>(cluster_layout_vmnk, cta_in_cluster_coord_vmnk) |
                               create_tma_multicast_mask<0,2>(cluster_layout_vmnk, cta_in_cluster_coord_vmnk);
 
-  // Calculate total bytes that TMA will transfer each tile to track completion, accounting for TMA.2SM
+  // 计算 TMA 每个 tile 传输的总字节数, 用于跟踪完成状态. 这里会计入 TMA.2SM 的两个 CTA.
   int tma_transaction_bytes = size<0>(cluster_layout_vmnk) * sizeof(make_tensor_like(tAsA))
                             + size<0>(cluster_layout_vmnk) * sizeof(make_tensor_like(tBsB));
 
@@ -327,105 +327,105 @@ gemm_device(ATensor mA,                      // (Gemm_M, Gemm_K)
   } __syncthreads();
 
   // Barrier 初始化
-  // Barriers in SMEM should be initialized by a single thread.
+  // SMEM 中的 barrier 应由单个线程初始化.
   if (elect_one_warp && elect_one_thr) {
-    // The number of CTAs that participates in multicast operation with this CTA (for both A and B matrices)
+    // 与当前 CTA 一起参与 multicast 的 CTA 数量 (对 A 和 B 矩阵都是如此)
     int num_mcast_participants = size<1>(cluster_layout_vmnk) + size<2>(cluster_layout_vmnk) - 1;
     cute::initialize_barrier(shared_storage.mma_barrier, /* num_ctas */ num_mcast_participants);
     cute::initialize_barrier(shared_storage.tma_barrier, /* num_threads */ 1);
   }
-  int mma_barrier_phase_bit = 0;  // Each barrier has an associated phase_bit.
-  int tma_barrier_phase_bit = 0;  // Each barrier has an associated phase_bit.
-  cute::cluster_sync();           // Make sure all CTAs in Cluster observe barrier init and TMEM alloc.
+  int mma_barrier_phase_bit = 0;  // 每个 barrier 都有一个关联的 phase_bit.
+  int tma_barrier_phase_bit = 0;  // 每个 barrier 都有一个关联的 phase_bit.
+  cute::cluster_sync();           // 确保 Cluster 内所有 CTA 都能看到 barrier 初始化和 TMEM 分配.
 
-  // 步骤 2: 主循环。
+  // 步骤 2: Mainloop.
 
-  // Set mma accumulate option to zero so that the first MMA instruction will clear the TMEM accumulator.
+  // 将 mma accumulate 选项设为 zero, 使第一条 MMA 指令清空 TMEM 累加器.
   tiled_mma.accumulate_ = UMMA::ScaleOut::Zero;
 
   // 执行 MmaTile_M x MmaTile_N x GEMM_K GEMM
   for (int k_tile = 0; k_tile < size<3>(tCgA); ++k_tile)
   {
-    // 步骤 2a: 加载 A、B tile
+    // 步骤 2a: 加载 A 和 B tile
 
-    // TMA Load Operations:
-    // - Execute asynchronous TMA loads with single thread
-    // - Both peer and leader CTAs initiate TMA loads
-    // - Set expected transaction bytes. For 2SM TMA instructions, the transaction bytes counts both CTAs.
-    // - Although TMAs are initiated by both peer and leader CTAs, the barrier is only set and waited by the leader CTA.
-    // - Initiate asynchronous transfers with a multicast mask that includes all CTAs that participate in multicast.
-    if (elect_one_warp && elect_one_thr) { // TMA loads are executed by one thread
-      if (elect_one_cta) { // Only the leader CTA waits for TMA transactions
-        cute::set_barrier_transaction_bytes(shared_storage.tma_barrier, tma_transaction_bytes); // Set the expected transaction bytes for the TMA loads
+    // TMA load 操作:
+    // - 使用单个线程执行异步 TMA load
+    // - peer CTA 和 leader CTA 都会发起 TMA load
+    // - 设置期望的 transaction bytes. 对 2SM TMA 指令, transaction bytes 会计入两个 CTA.
+    // - 虽然 peer CTA 和 leader CTA 都会发起 TMA, 但只有 leader CTA 设置和等待 barrier.
+    // - 用包含所有 multicast 参与 CTA 的 multicast mask 发起异步传输.
+    if (elect_one_warp && elect_one_thr) { // TMA load 由一个线程执行
+      if (elect_one_cta) { // 只有 leader CTA 等待 TMA transaction
+        cute::set_barrier_transaction_bytes(shared_storage.tma_barrier, tma_transaction_bytes); // 设置 TMA load 期望的 transaction bytes
       }
-      copy(tma_atom_A.with(shared_storage.tma_barrier,tma_mcast_mask_a), tAgA(_,k_tile), tAsA); // Load MmaTile_M x MmaTile_K A tile
-      copy(tma_atom_B.with(shared_storage.tma_barrier,tma_mcast_mask_b), tBgB(_,k_tile), tBsB); // Load MmaTile_N x MmaTile_K B tile
+      copy(tma_atom_A.with(shared_storage.tma_barrier,tma_mcast_mask_a), tAgA(_,k_tile), tAsA); // 加载 MmaTile_M x MmaTile_K A tile
+      copy(tma_atom_B.with(shared_storage.tma_barrier,tma_mcast_mask_b), tBgB(_,k_tile), tBsB); // 加载 MmaTile_N x MmaTile_K B tile
     }
 
     // 步骤 2b: 执行本 tile 的 MMA
 
     if (elect_one_cta) {
-      // 在 leader CTA 上等待 TMA 加载完成
+      // 在 leader CTA 上等待 TMA load 完成
       cute::wait_barrier(shared_storage.tma_barrier, tma_barrier_phase_bit);
       tma_barrier_phase_bit ^= 1;
 
-      // tcgen05.mma instructions require single-thread execution:
-      // - Only one warp performs the MMA-related loop operations
-      // - CuTe operations internally manage the single-thread execution of tcgen05.mma and tcgen05.cp
-      // - No explicit elect_one_sync region is needed from the user
+      // tcgen05.mma 指令要求单线程执行:
+      // - 只有一个 warp 执行 MMA 相关循环操作
+      // - CuTe 操作在内部管理 tcgen05.mma 和 tcgen05.cp 的单线程执行
+      // - 用户不需要显式写 elect_one_sync 区域
       if (elect_one_warp) {
         // 执行 MmaTile_M x MmaTile_N x MmaTile_K GEMM
         for (int k_block = 0; k_block < size<2>(tCrA); ++k_block) {
             gemm(tiled_mma, tCrA(_,_,k_block), tCrB(_,_,k_block), tCtAcc);
             tiled_mma.accumulate_ = UMMA::ScaleOut::One;
         }
-        // Ensure MMAs are completed, only then we can reuse the A and B SMEM.
-        cutlass::arch::umma_arrive_multicast_2x1SM(&shared_storage.mma_barrier, mma_mcast_mask_c); // All multicasting CTAs encoded in mask.
+        // 确保 MMA 已完成, 之后才能复用 A 和 B 的 SMEM.
+        cutlass::arch::umma_arrive_multicast_2x1SM(&shared_storage.mma_barrier, mma_mcast_mask_c); // 所有 multicast CTA 都编码在 mask 中.
       }
     }
-    // 等待 MMA 完成，避免覆盖 A、B 的 SMEM
+    // 等待 MMA 完成, 避免覆盖 A 和 B 的 SMEM.
     cute::wait_barrier(shared_storage.mma_barrier, mma_barrier_phase_bit);
     mma_barrier_phase_bit ^= 1;
   }
 
-  // 步骤 3: 收尾。
+  // 步骤 3: Epilogue.
 
-  // Apply rank-2 epilogue tiler to rank-2 MMA_V mode
+  // 将 rank-2 epilogue tiler 应用到 rank-2 MMA_V mode
   auto epi_tiler_v = make_tile(epi_tiler_mn);               // (EpiTile)
   Tensor tAcc_epi = zipped_divide(tCtAcc, epi_tiler_v);     // (EpiTile,NumTiles)
   Tensor gC_epi   = zipped_divide(tCgC,   epi_tiler_v);     // (EpiTile,NumTiles)
   Tensor gD_epi   = zipped_divide(tCgD,   epi_tiler_v);     // (EpiTile,NumTiles)
 
-  // Construct corresponding SMEM tensors
+  // 构造对应的 SMEM tensor
   Tensor sC_epi = shared_storage.tensor_sC();               // (EpiTile)
   Tensor sD_epi = shared_storage.tensor_sD();               // (EpiTile)
 
-  // TMA 分块
+  // 为 TMA 分块
   auto [tGS_gC, tGS_sC] = tma_partition(tma_atom_C, sC_epi, gC_epi); // (GMEM -> SMEM)
   auto [tSG_gD, tSG_sD] = tma_partition(tma_atom_D, sD_epi, gD_epi); // (SMEM -> GMEM)
 
-  // Reset transaction bytes for C load
+  // 为 C load 重置 transaction bytes
   tma_transaction_bytes = sizeof(make_tensor_like(tGS_sC));
 
-  // TMEM 累加器加载分块 (TMEM -> RMEM)
+  // 为 TMEM 累加器 load 分块 (TMEM -> RMEM)
   TiledCopy t2r_copy = make_tmem_copy(SM100_TMEM_LOAD_32dp32b1x{}, tAcc_epi(_,_0{}));
   ThrCopy   thr_t2r  = t2r_copy.get_slice(threadIdx.x);
   Tensor tTR_tAcc = thr_t2r.partition_S(tAcc_epi);          // (TmemCpy,NumTmemCpy,NumTiles)
   Tensor tTR_sC   = thr_t2r.partition_D(sC_epi);            // (TmemCpy,NumTmemCpy)
   Tensor tTR_sD   = thr_t2r.partition_D(sD_epi);            // (TmemCpy,NumTmemCpy)
-  // Allocate register tensors
+  // 分配寄存器 tensor
   Tensor tTR_rC = make_tensor_like(tTR_sC);                 // (TmemCpy,NumTmemCpy)
   Tensor tTR_rD = make_fragment_like(tTR_sD);               // (TmemCpy,NumTmemCpy)
 
-  // Loop over the epilogue tiles
+  // 遍历 epilogue tile
   CUTE_UNROLL
   for (int epi_tile_idx = 0; epi_tile_idx < size<2>(tTR_tAcc); ++epi_tile_idx) {
-    // TMA Load C:  GMEM -> SMEM
+    // TMA 加载 C: GMEM -> SMEM
     if (elect_one_warp && elect_one_thr) {
       cute::set_barrier_transaction_bytes(shared_storage.tma_barrier, tma_transaction_bytes);
-      copy(tma_atom_C.with(shared_storage.tma_barrier, 0 /*no multicast*/), tGS_gC(_,epi_tile_idx), tGS_sC);
+      copy(tma_atom_C.with(shared_storage.tma_barrier, 0 /* 无 multicast */), tGS_gC(_,epi_tile_idx), tGS_sC);
     }
-    // All threads wait for C TMA load to complete
+    // 所有线程等待 C 的 TMA load 完成
     cute::wait_barrier(shared_storage.tma_barrier, tma_barrier_phase_bit);
     tma_barrier_phase_bit ^= 1;
 
@@ -435,27 +435,27 @@ gemm_device(ATensor mA,                      // (Gemm_M, Gemm_K)
     // 加载 Acc: TMEM -> RMEM
     copy(t2r_copy, tTR_tAcc(_,_,epi_tile_idx), tTR_rD);
 
-    // Compute D = beta * C + alpha * (A*B)
+    // 计算 D = beta * C + alpha * (A*B)
     axpby(beta, tTR_rC, alpha, tTR_rD);
 
     // 存储 D: RMEM -> SMEM
-    __syncthreads(); // Ensure C loads are finished before reusing smem (unnecessary if smem layouts match)
+    __syncthreads(); // 复用 smem 前, 确保 C load 已完成 (如果 smem layout 匹配则不需要)
     copy_aligned(tTR_rD, tTR_sD);
 
-    // TMA Store D:  SMEM -> GMEM
-    tma_store_fence(); // Ensure D smem stores are visible to TMA
-    __syncthreads(); // Ensure all threads have issued fence
+    // TMA 存储 D: SMEM -> GMEM
+    tma_store_fence(); // 确保 D smem store 对 TMA 可见
+    __syncthreads(); // 确保所有线程都已发出 fence
     if (elect_one_warp && elect_one_thr) {
       copy(tma_atom_D, tSG_sD, tSG_gD(_,epi_tile_idx));
-      tma_store_arrive(); // issuing thread commits D TMA store
-      tma_store_wait<0>(); // issuing thread waits for D TMA store to complete
+      tma_store_arrive(); // 发起线程提交 D TMA store
+      tma_store_wait<0>(); // 发起线程等待 D TMA store 完成
     }
-    __syncthreads(); // All threads sync with issuing thread
+    __syncthreads(); // 所有线程与发起线程同步
   }
   __syncthreads();
 
-  // 释放分配权以便下一 CTA 可调度
-  // 然后释放 TMEM
+  // 先释放分配权, 让下一个 CTA 可以被调度.
+  // 然后释放 TMEM.
   if (elect_one_warp) {
     tmem_allocator.release_allocation_lock();
     tmem_allocator.free(shared_storage.tmem_base_ptr, TmemAllocator::Sm100TmemCapacityColumns);
@@ -479,13 +479,13 @@ void gemm_host_f16xf16_f32_f32_tnt(TypeA const* device_ptr_A, LayoutA layout_A,
   assert(shape<0>(layout_B) == shape<1>(layout_D));  // Gemm_N
   assert(shape<1>(layout_A) == shape<1>(layout_B));  // Gemm_K
 
-  // 在全局内存中表示完整张量
+  // 在 global memory 中表示完整 tensor
   Tensor mA = make_tensor(make_gmem_ptr(device_ptr_A), layout_A);      // (Gemm_M, Gemm_K)
   Tensor mB = make_tensor(make_gmem_ptr(device_ptr_B), layout_B);      // (Gemm_N, Gemm_K)
   Tensor mC = make_tensor(make_gmem_ptr(device_ptr_C), layout_C);      // (Gemm_M, Gemm_N)
   Tensor mD = make_tensor(make_gmem_ptr(device_ptr_D), layout_D);      // (Gemm_M, Gemm_N)
 
-  // 获取本 GEMM 的 M、N、K 维度
+  // 获取当前 GEMM 的 M, N, K 维度
   auto Gemm_M = shape<0>(layout_A);
   auto Gemm_N = shape<0>(layout_B);
   auto Gemm_K = shape<1>(layout_A);
@@ -497,35 +497,36 @@ void gemm_host_f16xf16_f32_f32_tnt(TypeA const* device_ptr_A, LayoutA layout_A,
   //
   ////////////////////////////////////////////////////////////
 
-  // 创建 TiledMma。make_tiled_mma 以目标指令及(可选)指令布局为参数，从给定 mma 指令构建更大的 TiledMma。
-  // See cute/arch/mma_sm100_umma.hpp for all tcgen05.mma instructions
-  TiledMMA tiled_mma = make_tiled_mma(SM100_MMA_F16BF16_2x1SM_SS<TypeA, TypeB, TypeC,                 // Mma's A, B, and Accumulator types
-                                                                 256, 256,                            // Mma M and N dimensions
-                                                                 UMMA::Major::K, UMMA::Major::K>{});  // A and B layouts
+  // 创建 TiledMma. make_tiled_mma 以目标指令和可选的指令 layout 为参数,
+  // 基于给定 mma 指令创建更大的 TiledMma.
+  // 查看 cute/arch/mma_sm100_umma.hpp 可了解所有 tcgen05.mma 指令.
+  TiledMMA tiled_mma = make_tiled_mma(SM100_MMA_F16BF16_2x1SM_SS<TypeA, TypeB, TypeC,                 // Mma 的 A, B 和累加器类型
+                                                                 256, 256,                            // Mma 的 M 和 N 维度
+                                                                 UMMA::Major::K, UMMA::Major::K>{});  // A 和 B layout
 
-  // We can also print and inspect the tiled_mma
+  // 也可以打印并检查 tiled_mma
   print(tiled_mma);
   // TiledMMA
   //   ThrLayoutVMNK:  (_2,_1,_1,_1):(_1,_0,_0,_0)
   //   PermutationMNK: (_,_,_)
   // MMA_Atom
   //   ThrID:      _2:_1
-  //   Shape_MNK:  (_256,_256,_16)                      // MmaM, MmaN, MmaK (MmaK is constant for each instr.)
-  //   LayoutA_TV: (_2,(_128,_16)):(_128,(_1,_256))     // TV -> MmaCoordinate mapping for A matrix
-  //   LayoutB_TV: (_2,(_128,_16)):(_128,(_1,_256))     // TV -> MmaCoordinate mapping for B matrix
-  //   LayoutC_TV: (_2,(_128,_256)):(_128,(_1,_256))    // TV -> MmaCoordinate mapping for C matrix
+  //   Shape_MNK:  (_256,_256,_16)                      // MmaM, MmaN, MmaK (每条指令的 MmaK 固定)
+  //   LayoutA_TV: (_2,(_128,_16)):(_128,(_1,_256))     // TV -> A 矩阵的 MmaCoordinate 映射
+  //   LayoutB_TV: (_2,(_128,_16)):(_128,(_1,_256))     // TV -> B 矩阵的 MmaCoordinate 映射
+  //   LayoutC_TV: (_2,(_128,_256)):(_128,(_1,_256))    // TV -> C 矩阵的 MmaCoordinate 映射
 
   // 定义 MMA tiler 尺寸 (静态)
-  auto bM = tile_size<0>(tiled_mma);             // MMA Tile M. We'll use 1 MMAs per MMA Tile M.
-  auto bN = tile_size<1>(tiled_mma);             // MMA Tile N. We'll use 1 MMAs per MMA Tile M.
-  auto bK = tile_size<2>(tiled_mma) * Int<4>{};  // MMA Tile K. We'll use 4 MMAs per MMA Tile K. For 16b types, tcgen05.mma has K16.
+  auto bM = tile_size<0>(tiled_mma);             // MMA Tile M. 每个 MMA Tile M 使用 1 个 MMA.
+  auto bN = tile_size<1>(tiled_mma);             // MMA Tile N. 每个 MMA Tile N 使用 1 个 MMA.
+  auto bK = tile_size<2>(tiled_mma) * Int<4>{};  // MMA Tile K. 每个 MMA Tile K 使用 4 个 MMA. 对 16b 类型, tcgen05.mma 为 K16.
   auto mma_tiler = make_shape(bM, bN, bK);       // (MMA_M, MMA_N, MMA_K)
 
-  // In SM90,  the MMAs are CTA-local and perform thread-level partitioning.
-  // In SM100, the MMAs are Cluster-local and perform CTA-level partitioning.
-  // Thus, SM90 uses a cta_tiler to extract portions of the Problem for the CTA
-  //  and SM100 uses a mma_tiler to extract portions of the Problem for the MMA.
-  //  The MMA's partitioning then yields the CTA-local work.
+  // 在 SM90 中, MMA 是 CTA-local 的, 并执行线程级分块.
+  // 在 SM100 中, MMA 是 Cluster-local 的, 并执行 CTA 级分块.
+  // 因此, SM90 使用 cta_tiler 从 Problem 中取出 CTA 对应部分,
+  // 而 SM100 使用 mma_tiler 从 Problem 中取出 MMA 对应部分.
+  // 随后 MMA 的分块会给出 CTA-local 的工作.
 
   if (not evenly_divides(shape(mma_tiler), tile_shape(tiled_mma))) {
     std::cerr << "The MMA Shape should evenly divide the MMA Tiler." << std::endl;
@@ -538,80 +539,80 @@ void gemm_host_f16xf16_f32_f32_tnt(TypeA const* device_ptr_A, LayoutA layout_A,
   }
 
   //
-  // Determine the SMEM layouts:
+  // 确定 SMEM layout:
   //
 
-  //  * SMEM layouts for A and B must match the post-partitioned (CTA-local) shapes expected by the MMA instructions.
-  //  * CuTe provides partition_shape_[A|B] functions to determine the post-partitioned shape.
-  //    These functions take the TiledMma, and the MMA Tile Shape as inputs and returns a shape that is at least rank-3
-  //    where the first mode has the same shape as the MMA instruction, 2nd and 3rd mode expresses the number of time
-  //    MMA instr is repeated in M/N mode and K mode of MMA tile, respectively.
-  //  * Note that SMEM layouts are needed to determine SMEM allocation for kernel launch.
+  //  * A 和 B 的 SMEM layout 必须匹配 MMA 指令期望的后分块 (CTA-local) shape.
+  //  * CuTe 提供 partition_shape_[A|B] 函数来确定后分块 shape.
+  //    这些函数以 TiledMma 和 MMA Tile Shape 为输入, 返回至少 rank-3 的 shape.
+  //    其中第一个 mode 与 MMA 指令具有相同 shape, 第二和第三个 mode 分别表示
+  //    MMA 指令在 MMA tile 的 M/N mode 和 K mode 上重复的次数.
+  //  * 注意, kernel launch 时需要 SMEM layout 来确定 SMEM 分配大小.
 
-  // Pre-partitioned Tile Shape (MmaTile_M, MmaTile_K) to post-partitioned (MmaA, NumMma_M, NumMma_K)
+  // 分块前 Tile Shape (MmaTile_M, MmaTile_K) 到分块后 (MmaA, NumMma_M, NumMma_K)
   auto mma_shape_A = partition_shape_A(tiled_mma, make_shape(size<0>(mma_tiler), size<2>(mma_tiler)));
-  // Pre-partitioned Tile Shape (MmaTile_N, MmaTile_K) to post-partitioned (MmaB, NumMma_N, NumMma_K)
+  // 分块前 Tile Shape (MmaTile_N, MmaTile_K) 到分块后 (MmaB, NumMma_N, NumMma_K)
   auto mma_shape_B = partition_shape_B(tiled_mma, make_shape(size<1>(mma_tiler), size<2>(mma_tiler)));
 
-  // Print and inspect mma_shape_A, and mma_shape_B for this example.
+  // 打印并检查本例的 mma_shape_A 和 mma_shape_B.
   print("mma_shape_A:\t"); print(mma_shape_A); print("\n");  // mma_shape_A:  ((_128,_16),_1,_4)
   print("mma_shape_B:\t"); print(mma_shape_B); print("\n");  // mma_shape_B:  ((_256,_16),_1,_4)
 
-  // A and B tensors are swizzled in SMEM to improve MMA performance.
-  //  * However, expressing swizzled layouts is very hard.
-  //  * CuTe provides tile_to_mma_shape functions for SM100 to create swizzled layouts for post-partitioned Mma Shapes
+  // A 和 B tensor 在 SMEM 中使用 swizzle 以提升 MMA 性能.
+  //  * 但表达 swizzled layout 很困难.
+  //  * CuTe 为 SM100 提供 tile_to_mma_shape 函数, 用于为后分块 Mma Shape 创建 swizzled layout.
   auto sA_layout = UMMA::tile_to_mma_shape(UMMA::Layout_K_SW128_Atom<TypeA>{}, mma_shape_A);
   auto sB_layout = UMMA::tile_to_mma_shape(UMMA::Layout_K_SW128_Atom<TypeB>{}, mma_shape_B);
 
-  // Print and inspect sA_layout and sB_layout for this example.
+  // 打印并检查本例的 sA_layout 和 sB_layout.
   print("sA_layout:\t"); print(sA_layout); print("\n");      // sA_layout:   Sw<3,4,3> o smem_ptr[16b](unset) o ((_128,_16),_1,_4):((_64,_1),_0,_16)
   print("sB_layout:\t"); print(sB_layout); print("\n");      // sB_layout:   Sw<3,4,3> o smem_ptr[16b](unset) o ((_256,_16),_1,_4):((_64,_1),_0,_16)
 
   //
-  // Epilogue parameters
+  // Epilogue 参数
   //
 
-  // Pre-partitioned Tile Shape (MmaTile_M, MmaTile_N) to post-partitioned ((MmaM,MmaN), NumMma_M, NumMma_N)
+  // 分块前 Tile Shape (MmaTile_M, MmaTile_N) 到分块后 ((MmaM,MmaN), NumMma_M, NumMma_N)
   auto mma_shape_C = partition_shape_C(tiled_mma, make_shape(size<0>(mma_tiler), size<1>(mma_tiler)));
 
-  // For TMA epilogue performance it may be beneficial to iterate over the output in smaller tiles than the MMA tile
-  auto epi_tiler = make_tile(size<0,0>(mma_shape_C), size<0,1>(mma_shape_C) / Int<4>{});  // 4 TMA copies per CTA per MMA tile
+  // 为了 TMA epilogue 性能, 用小于 MMA tile 的 tile 遍历输出可能更有利
+  auto epi_tiler = make_tile(size<0,0>(mma_shape_C), size<0,1>(mma_shape_C) / Int<4>{});  // 每个 CTA 的每个 MMA tile 使用 4 次 TMA copy
 
-  // SMEM layouts for C and D should match the epilogue tile
-  auto sC_layout_mn = tile_to_shape(UMMA::Layout_K_SW128_Atom<TypeC>{}, // MMA K-major is equivalent to epilogue N-major
+  // C 和 D 的 SMEM layout 应匹配 epilogue tile
+  auto sC_layout_mn = tile_to_shape(UMMA::Layout_K_SW128_Atom<TypeC>{}, // MMA K-major 等价于 epilogue N-major
                                     make_shape(size<0>(epi_tiler), size<1>(epi_tiler)));
-  auto sC_layout = group<0,2>(sC_layout_mn); // Group modes for tma_partition
+  auto sC_layout = group<0,2>(sC_layout_mn); // 为 tma_partition 合并 mode
 
-  auto sD_layout_mn = tile_to_shape(UMMA::Layout_K_SW128_Atom<TypeD>{}, // MMA K-major is equivalent to epilogue N-major
+  auto sD_layout_mn = tile_to_shape(UMMA::Layout_K_SW128_Atom<TypeD>{}, // MMA K-major 等价于 epilogue N-major
                                     make_shape(size<0>(epi_tiler), size<1>(epi_tiler)));
-  auto sD_layout = group<0,2>(sD_layout_mn); // Group modes for tma_partition
+  auto sD_layout = group<0,2>(sD_layout_mn); // 为 tma_partition 合并 mode
 
   print("sC_layout:\t"); print(sC_layout); print("\n");      // sC_layout:   Sw<3,4,3> o smem_ptr[32b](unset) o ((_8,_16),(_32,_2)):((_32,_256),(_1,_4096))
   print("sD_layout:\t"); print(sD_layout); print("\n");      // sD_layout:   Sw<3,4,3> o smem_ptr[32b](unset) o ((_8,_16),(_32,_2)):((_32,_256),(_1,_4096))
 
-  // Now we can find the SMEM allocation size
+  // 现在可以得到 SMEM 分配大小
   using SMEMStorage = SharedStorage<TypeA, TypeB, TypeC, TypeD,
                                     decltype(sA_layout), decltype(sB_layout),
                                     decltype(sC_layout), decltype(sD_layout)>;
 
   //
-  // TMA Descriptor Creation (Host Side)
+  // TMA Descriptor 创建 (host 侧)
   //
 
-  // The cluster shape and layout
+  // Cluster shape 和 layout
   auto cluster_shape = make_shape(Int<4>{}, Int<4>{}, Int<1>{});
   Layout cluster_layout_vmnk = tiled_divide(make_layout(cluster_shape),
                                             make_tile(typename decltype(tiled_mma)::AtomThrID{}));
 
-  // SM100 interface for creating TMA loads.
+  // 创建 TMA load 的 SM100 接口.
   Copy_Atom tma_atom_A = make_tma_atom_A_sm100(
-      SM100_TMA_2SM_LOAD_MULTICAST{}, // TMA load operation -- Multicasting 2SM instruction.
-      mA,                             // Source GMEM tensor
-      sA_layout,                      // Destination SMEM layout
-      mma_tiler,                      // MmaTiler_MNK. Unlike Sm90 interface where the tiler only included M and K modes.
-      tiled_mma,                      // Sm100 also requires the TiledMma to perform CTA-level partitioning.
-      cluster_layout_vmnk);           // ClusterLayout_VMNK. Unlike Sm90 interface where only the multicasting mode is passed.
-                                      //   We have make_tma_atom_[A|B]_sm100 and which determines the multicast mode.
+      SM100_TMA_2SM_LOAD_MULTICAST{}, // TMA load 操作, 使用 Multicasting 2SM 指令.
+      mA,                             // 源 GMEM tensor
+      sA_layout,                      // 目标 SMEM layout
+      mma_tiler,                      // MmaTiler_MNK. 与 Sm90 接口不同, 这里的 tiler 不只包含 M 和 K mode.
+      tiled_mma,                      // Sm100 还需要 TiledMma 来执行 CTA 级分块.
+      cluster_layout_vmnk);           // ClusterLayout_VMNK. 与 Sm90 接口不同, 这里不只传入 multicasting mode.
+                                      //   make_tma_atom_[A|B]_sm100 会决定 multicast mode.
   Tensor mA_tma = tma_atom_A.get_tma_tensor(shape(mA));   // (Gemm_M, Gemm_K)
 
   print("tma_atom_A:\t"); print(tma_atom_A); print("\n");
@@ -622,15 +623,15 @@ void gemm_host_f16xf16_f32_f32_tnt(TypeA const* device_ptr_A, LayoutA layout_A,
   //  ValLayoutRef: (_2,_8192):(_8192,_1)
   //  ValueType:    16b
 
-  // SM100 interface for creating TMA loads.
+  // 创建 TMA load 的 SM100 接口.
   Copy_Atom tma_atom_B = make_tma_atom_B_sm100(
-    SM100_TMA_2SM_LOAD_MULTICAST{}, // TMA load operation -- Multicasting 2SM instruction.
-    mB,                             // Source GMEM tensor
-    sB_layout,                      // Destination SMEM layout
-    mma_tiler,                      // MmaTiler_MNK. Unlike Sm90 interface where the tiler only included M and K modes.
-    tiled_mma,                      // Sm100 also requires the TiledMma to perform CTA-level partitioning.
-    cluster_layout_vmnk);           // ClusterLayout_VMNK. Unlike Sm90 interface where only the multicasting mode is passed.
-                                    //   We have make_tma_atom_[A|B]_sm100 and which determines the multicast mode.
+    SM100_TMA_2SM_LOAD_MULTICAST{}, // TMA load 操作, 使用 Multicasting 2SM 指令.
+    mB,                             // 源 GMEM tensor
+    sB_layout,                      // 目标 SMEM layout
+    mma_tiler,                      // MmaTiler_MNK. 与 Sm90 接口不同, 这里的 tiler 不只包含 M 和 K mode.
+    tiled_mma,                      // Sm100 还需要 TiledMma 来执行 CTA 级分块.
+    cluster_layout_vmnk);           // ClusterLayout_VMNK. 与 Sm90 接口不同, 这里不只传入 multicasting mode.
+                                    //   make_tma_atom_[A|B]_sm100 会决定 multicast mode.
   Tensor mB_tma = tma_atom_B.get_tma_tensor(shape(mB));   // (Gemm_N, Gemm_K)
 
   print("tma_atom_B:\t"); print(tma_atom_B); print("\n");
@@ -642,10 +643,10 @@ void gemm_host_f16xf16_f32_f32_tnt(TypeA const* device_ptr_A, LayoutA layout_A,
   // ValueType:    16b
 
   Copy_Atom tma_atom_C = make_tma_atom(
-        SM90_TMA_LOAD{},            // TMA load operation
-        mC,                         // Source GMEM tensor
-        sC_layout,                  // Destination SMEM layout
-        epi_tiler);                 // MN Tiler for epilogue
+        SM90_TMA_LOAD{},            // TMA load 操作
+        mC,                         // 源 GMEM tensor
+        sC_layout,                  // 目标 SMEM layout
+        epi_tiler);                 // epilogue 的 MN Tiler
   Tensor mC_tma = tma_atom_C.get_tma_tensor(shape(mC));   // (Gemm_M, Gemm_N)
 
   print("tma_atom_C:\t"); print(tma_atom_C); print("\n");
@@ -657,10 +658,10 @@ void gemm_host_f16xf16_f32_f32_tnt(TypeA const* device_ptr_A, LayoutA layout_A,
   //   ValueType:    32b
 
   Copy_Atom tma_atom_D = make_tma_atom(
-        SM90_TMA_STORE{},           // TMA store operation
-        mD,                         // Destination GMEM tensor
-        sD_layout,                  // Source SMEM layout
-        epi_tiler);                 // MN Tiler for epilogue
+        SM90_TMA_STORE{},           // TMA store 操作
+        mD,                         // 目标 GMEM tensor
+        sD_layout,                  // 源 SMEM layout
+        epi_tiler);                 // epilogue 的 MN Tiler
   Tensor mD_tma = tma_atom_D.get_tma_tensor(shape(mD));   // (Gemm_M, Gemm_N)
 
   print("tma_atom_D:\t"); print(tma_atom_D); print("\n");
@@ -686,10 +687,10 @@ void gemm_host_f16xf16_f32_f32_tnt(TypeA const* device_ptr_A, LayoutA layout_A,
   auto* kernel_ptr = &gemm_device<SMEMStorage,
                                   decltype(mA_tma), decltype(mB_tma), decltype(mC_tma), decltype(mD_tma),
                                   decltype(mma_tiler), decltype(epi_tiler), decltype(tiled_mma), decltype(cluster_shape),
-                                  decltype(tma_atom_A), decltype(tma_atom_B), decltype(tma_atom_C), decltype(tma_atom_D), // Includes the TMA descriptor.
+                                  decltype(tma_atom_A), decltype(tma_atom_B), decltype(tma_atom_C), decltype(tma_atom_D), // 包含 TMA descriptor.
                                   Alpha, Beta>;
 
-  // 设置 kernel 属性 (SMEM)
+  // 设置 kernel 属性 (设置 SMEM)
   CUTE_CHECK_ERROR(cudaFuncSetAttribute(kernel_ptr,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         smemBytes));
@@ -746,34 +747,34 @@ int main(int argc, char** argv)
 
   ////////////////////////////////////////////////////////////
   //
-  // 创建 A、B、C、D 张量
+  // 创建 A, B, C 和 D tensor
   //
   ////////////////////////////////////////////////////////////
-  // 定义数据类型。A、B 类型与 MMA 指令一致。
-  using TypeA = cutlass::half_t; // MMA A Data Type
+  // 定义数据类型. A 和 B 的类型与 MMA 指令一致.
+  using TypeA = cutlass::half_t; // MMA A 数据类型
   auto type_str_a = "half_t";
-  using TypeB = cutlass::half_t; // MMA B Data Type
+  using TypeB = cutlass::half_t; // MMA B 数据类型
   auto type_str_b = "half_t";
-  using TypeC = float;           // MMA C Data Type
+  using TypeC = float;           // MMA C 数据类型
   [[maybe_unused]] auto type_str_c = "float";
-  using TypeD = float;           // MMA D Data Type
+  using TypeD = float;           // MMA D 数据类型
   auto type_str_d = "float";
-  using TypeAccumulator = float; // Both TypeC and TypeD are float, use float accumulator type.
+  using TypeAccumulator = float; // TypeC 和 TypeD 都是 float, 因此使用 float 累加器.
 
-  // A tensor MxK K-major (Layout T = Row-Major)
+  // A tensor 为 MxK K-major (Layout T = Row-Major)
   Layout layout_A = make_layout(make_shape (Gemm_M,   Gemm_K),
                                 make_stride(Gemm_K, Int<1>{}));   // (Gemm_M,Gemm_K):(Gemm_K,_1)
-  // B tensor NxK K-major (Layout N = Column-Major)
+  // B tensor 为 NxK K-major (Layout N = Column-Major)
   Layout layout_B = make_layout(make_shape (Gemm_N,   Gemm_K),
                                 make_stride(Gemm_K, Int<1>{}));   // (Gemm_N,Gemm_K):(Gemm_K,_1)
-  // C tensor MxN N-major (Layout T = Row-Major)
+  // C tensor 为 MxN N-major (Layout T = Row-Major)
   Layout layout_C = make_layout(make_shape (Gemm_M,   Gemm_N),
                                 make_stride(Gemm_N, Int<1>{}));   // (Gemm_M,Gemm_N):(Gemm_N,_1)
-  // D tensor MxN N-major (Layout T = Row-Major)
+  // D tensor 为 MxN N-major (Layout T = Row-Major)
   Layout layout_D = make_layout(make_shape (Gemm_M,   Gemm_N),
                                 make_stride(Gemm_N, Int<1>{}));   // (Gemm_M,Gemm_N):(Gemm_N,_1)
 
-  // A、B、C 的 host 分配与 host CuTe 张量。
+  // 为 A, B 和 C tensor 创建 host 端分配及 host CuTe tensor.
   thrust::host_vector<TypeA>   host_A(Gemm_M * Gemm_K);
   Tensor host_tensor_A = make_tensor(host_A.data(), layout_A);
   print("host_tensor_A:\t"); print(host_tensor_A); print("\n"); // host_tensor_A:	ptr[16b](ADDR_A) o (512,256):(256,_1)
@@ -786,15 +787,15 @@ int main(int argc, char** argv)
   Tensor host_tensor_C = make_tensor(host_C.data(), layout_C);
   print("host_tensor_C:\t"); print(host_tensor_C); print("\n"); // host_tensor_C:	ptr[32b](ADDR_C) o (512,1024):(1024,_1)
 
-  // 暂不需要 D 的 host_tensor。
+  // 这里暂时不需要为 D 创建 host_tensor.
   thrust::device_vector<TypeD> device_D(Gemm_M * Gemm_N);
 
-  // 用随机值初始化 A、B、C。
+  // 使用随机值初始化 A, B 和 C tensor.
   initialize_tensor(host_tensor_A);
   initialize_tensor(host_tensor_B);
   initialize_tensor(host_tensor_C);
 
-  // 将 A、B、C 从 host 拷贝到 device
+  // 将 A, B 和 C tensor 从 host memory 拷贝到 device memory
   thrust::device_vector<TypeA> device_A = host_A;
   thrust::device_vector<TypeB> device_B = host_B;
   thrust::device_vector<TypeC> device_C = host_C;
@@ -803,20 +804,20 @@ int main(int argc, char** argv)
   using Beta = float;
   Alpha alpha = 1.0f;
   Beta beta = 0.0f;
-  // 设置输入/输出张量与 kernel 参数，在 device 上执行 kernel
+  // 设置输入/输出 tensor 和 kernel 参数, 并在 device 上执行 kernel
   gemm_host_f16xf16_f32_f32_tnt(device_A.data().get(), layout_A,
                                 device_B.data().get(), layout_B,
                                 device_C.data().get(), layout_C,
                                 device_D.data().get(), layout_D,
                                 alpha, beta);
-  // D 的 host 分配，并从 device 拷贝 D
+  // 为 D tensor 创建 host 端分配, 并将 D tensor 从 device 传回 host
   thrust::host_vector<TypeD> host_D = device_D;
-  // 为 D 创建非拥有型 CuTe 张量
+  // 为 D tensor 创建 non-owning CuTe tensor
   Tensor host_tensor_D = make_tensor(host_D.data(), layout_D);
 
   ////////////////////////////////////////////////////////////
   //
-  // 执行参考 GEMM kernel
+  // 执行 reference GEMM kernel
   //
   ////////////////////////////////////////////////////////////
 
@@ -826,7 +827,7 @@ int main(int argc, char** argv)
 
   ////////////////////////////////////////////////////////////
   //
-  // Compare results
+  // 比较结果
   //
   ////////////////////////////////////////////////////////////
 

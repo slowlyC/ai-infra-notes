@@ -30,7 +30,7 @@
  **************************************************************************************************/
 
 #pragma once
-#include <cute/tensor.hpp>                    // CuTe 张量实现
+#include <cute/tensor.hpp>                    // CuTe tensor 实现
 #include <cute/arch/copy_sm90_desc.hpp>
 
 template <class AccType,
@@ -89,7 +89,7 @@ compare_results(TensorA const& tensor_A, TensorB const& tensor_B,
   return (!norm_A.found_nan) && (!norm_B.found_nan) &&
          (!norm_C.found_nan) && (!norm_D.found_nan) && (!norm_ref_D.found_nan) &&                 // 无 NaN
          (norm_A.inf_norm > 0.0) && (norm_B.inf_norm > 0.0) &&
-         (norm_C.inf_norm > 0.0) && (norm_D.inf_norm > 0.0) && (norm_ref_D.inf_norm > 0.0) &&     // 张量中数值非零
+         (norm_C.inf_norm > 0.0) && (norm_D.inf_norm > 0.0) && (norm_ref_D.inf_norm > 0.0) &&     // Tensor 中的值非零
          (norm_diff.inf_norm <= 0.0);                                                             // 差值 (ref_D-D) == 0
 }
 

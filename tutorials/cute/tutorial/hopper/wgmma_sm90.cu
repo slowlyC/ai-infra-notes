@@ -89,21 +89,21 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   CUTE_STATIC_ASSERT_V(congruent(select<0,1>(shape_MNK), dC));         // dC strides for shape MN
 
   //
-  // 完整张量与分块张量
+  // Full and Tiled Tensors
   //
 
-  // 表示完整张量
+  // Represent the full tensors
   Tensor mA = make_tensor(make_gmem_ptr(A), select<0,2>(shape_MNK), dA); // (M,K)
   Tensor mB = make_tensor(make_gmem_ptr(B), select<1,2>(shape_MNK), dB); // (N,K)
   Tensor mC = make_tensor(make_gmem_ptr(C), select<0,1>(shape_MNK), dC); // (M,N)
 
-  // 获取本 thread block 对应的块
+  // Get the appropriate blocks for this thread block
   auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);              // (m,n,k)
   Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X,_1>{});  // (BLK_M,BLK_K,k)
   Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step< X,_1,_1>{});  // (BLK_N,BLK_K,k)
   Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1,_1, X>{});  // (BLK_M,BLK_N)
 
-  // 共享内存张量
+  // Shared memory tensors
   extern __shared__ char shared_memory[];
   using SharedStorage = SharedStorage<TA, TB, ASmemLayout, BSmemLayout>;
   SharedStorage& smem = *reinterpret_cast<SharedStorage*>(shared_memory);
@@ -111,7 +111,7 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   Tensor sB = make_tensor(make_smem_ptr(smem.B.begin()), BSmemLayout{}); // (BLK_N,BLK_K,PIPE)
 
   //
-  // 在各线程间分配 A、B tile 的拷贝
+  // Partition the copying of A and B tiles across the threads
   //
 
   ThrCopy thr_copy_a = copy_a.get_slice(threadIdx.x);
@@ -151,7 +151,7 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   // }
 
   //
-  // 定义 A/B 分块与 C 累加器
+  // Define A/B partitioning and C accumulators
   //
 
   ThrMMA thr_mma = mma.get_slice(threadIdx.x);
@@ -159,17 +159,17 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   Tensor tCsB = thr_mma.partition_B(sB);                               // (MMA,MMA_N,MMA_K,PIPE)
   Tensor tCgC = thr_mma.partition_C(gC);                               // (MMA,MMA_M,MMA_N)
 
-  // 为流水线分配寄存器
+  // Allocate registers for pipelining
   Tensor tCrA = thr_mma.make_fragment_A(tCsA);                         // (MMA,MMA_M,MMA_K,PIPE)
   Tensor tCrB = thr_mma.make_fragment_B(tCsB);                         // (MMA,MMA_N,MMA_K,PIPE)
-  // 分配累加器，与投影后数据同大小
+  // Allocate the accumulators -- same size as the projected data
   Tensor tCrC = thr_mma.make_fragment_C(tCgC);                         // (MMA,MMA_M,MMA_N)
 
   CUTE_STATIC_ASSERT_V((size<1>(tCgC) == size<1>(tCsA)));              // MMA_M
   CUTE_STATIC_ASSERT_V((size<2>(tCgC) == size<1>(tCsB)));              // MMA_N
   CUTE_STATIC_ASSERT_V((size<2>(tCsA) == size<2>(tCsB)));              // MMA_K
 
-  // 清空累加器
+  // Clear the accumulators
   clear(tCrC);
 
 #if 0
@@ -207,16 +207,16 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
 
 #if 1
 
-  // k-tile 总数
+  // Total number of k-tiles
   auto K_TILE_MAX  = size<3>(tAgA);
-  // SMEM 中流水线 k-tile 数量
+  // Number of pipelined k-tiles in smem
   auto K_PIPE_MAX  = size<3>(tAsA);
 
   //
-  // 预取
+  // PREFETCH
   //
 
-  // 预取除最后一块外的所有块
+  // Prefetch all but the last
   CUTE_UNROLL
   for (int k = 0; k < K_PIPE_MAX-1; ++k)
   {
@@ -225,18 +225,18 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
     cp_async_fence();
   }
 
-  // 清空累加器
+  // Clear the accumulators
   clear(tCrC);
 
   __syncthreads();
 
   //
-  // 流水线主循环
+  // PIPELINED MAIN LOOP
   //
 
-  // 当前读取的 pipe
+  // Current pipe to read from
   int k_pipe_read  = 0;
-  // 当前写入的 pipe
+  // Current pipe to write to
   int k_pipe_write = K_PIPE_MAX-1;
 
   CUTE_NO_UNROLL
@@ -246,22 +246,22 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
     k_tile_next = (k_tile_next >= K_TILE_MAX) ? K_TILE_MAX-1 : k_tile_next;
 
     //
-    // 将 gmem 拷贝到 smem (k_tile_write)
+    // Copy gmem to smem for k_tile_write
     //
 
     copy(copy_a, tAgA(_,_,_,k_tile_next), tAsA(_,_,_,k_pipe_write));
     copy(copy_b, tBgB(_,_,_,k_tile_next), tBsB(_,_,_,k_pipe_write));
     cp_async_fence();
 
-    // 推进 k_pipe_write
+    // Advance k_pipe_write
     ++k_pipe_write;
     k_pipe_write = (k_pipe_write == K_PIPE_MAX) ? 0 : k_pipe_write;
 
     //
-    // 在 k_tile 上计算
+    // Compute on k_tile
     //
 
-    // 等待 cp.async 完成，通过流水线重叠 GMEM 读取以优化
+    // Wait on all cp.async -- optimize by pipelining to overlap GMEM reads
     cp_async_wait<0>();
 
     warpgroup_fence_operand(tCrC);
@@ -269,11 +269,11 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
     // (V,M,K) x (V,N,K) => (V,M,N)
     cute::gemm(mma, tCrA(_,_,_,k_pipe_read), tCrB(_,_,_,k_pipe_read), tCrC);
     warpgroup_commit_batch();
-    /// 等待 GMMA barrier，确保 K_PIPE_MMAS (或更少) 未完成时 smem_pipe_write 被消费
+    /// Wait on the GMMA barrier for K_PIPE_MMAS (or fewer) outstanding to ensure smem_pipe_write is consumed
     warpgroup_wait<0>();
     warpgroup_fence_operand(tCrC);
 
-    // 推进 k_pipe_read
+    // Advance k_pipe_read
     ++k_pipe_read;
     k_pipe_read = (k_pipe_read == K_PIPE_MAX) ? 0 : k_pipe_read;
   }
@@ -281,13 +281,13 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
 #endif
 
   //
-  // 收尾
+  // Epilogue
   //
 
   axpby(alpha, tCrC, beta, tCgC);
 }
 
-// 配置 NT GEMM 参数
+// Setup params for a NT GEMM
 template <class TA, class TB, class TC,
           class Alpha, class Beta>
 void
@@ -299,29 +299,29 @@ gemm_nt(int m, int n, int k,
         TC      * C, int ldC,
         cudaStream_t stream = 0)
 {
-  // 定义 shape (动态)
+  // Define shapes (dynamic)
   auto M = int(m);
   auto N = int(n);
   auto K = int(k);
   auto prob_shape = make_shape(M, N, K);                     // (M, N, K)
 
-  // 定义 NT 步长 (混合)
+  // Define NT strides (mixed)
   auto dA = make_stride(Int<1>{}, ldA);                      // (dM, dK)
   auto dB = make_stride(Int<1>{}, ldB);                      // (dN, dK)
   auto dC = make_stride(Int<1>{}, ldC);                      // (dM, dN)
 
-  // 定义 CTA tile 尺寸 (静态)
+  // Define CTA tile sizes (static)
   auto bM = Int<128>{};
   auto bN = Int<128>{};
   auto bK = Int< 64>{};
   auto cta_tiler = make_shape(bM, bN, bK);                   // (BLK_M, BLK_N, BLK_K)
   auto bP = Int<3>{};  // Pipeline
 
-  // 定义 SMEM layout (静态)
+  // Define the smem layouts (static)
   auto sA = tile_to_shape(GMMA::Layout_MN_SW128_Atom<TA>{}, make_shape(bM,bK,bP));
   auto sB = tile_to_shape(GMMA::Layout_MN_SW128_Atom<TB>{}, make_shape(bN,bK,bP));
 
-  // 定义线程 layout (静态)
+  // Define the thread layouts (static)
   TiledCopy copyA = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, TA>{},
                                     Layout<Shape<_16,_8>>{}, // Thr layout 32x4 m-major
                                     Layout<Shape< _8,_1>>{});// Val layout  8x1 m-major
@@ -344,10 +344,10 @@ gemm_nt(int m, int n, int k,
 #endif
 
   //
-  // 配置与启动
+  // Setup and Launch
   //
 
-  // 启动参数配置
+  // Launch parameter setup
   dim3 dimBlock(size(tiled_mma));
   dim3 dimCluster(1, 1, 1);
   dim3 dimGrid(round_up(size(ceil_div(m, bM)), dimCluster.x),
@@ -364,7 +364,7 @@ gemm_nt(int m, int n, int k,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         smemBytes));
 
-  // Kernel 启动
+  // Kernel Launch
   cutlass::ClusterLaunchParams params = {dimGrid, dimBlock, dimCluster, smemBytes};
   cutlass::Status status = cutlass::launch_kernel_on_cluster(params, (void const*) kernel_ptr,
                                                              prob_shape, cta_tiler,
@@ -379,7 +379,7 @@ gemm_nt(int m, int n, int k,
   }
 }
 
-// 配置 TN GEMM 参数
+// Setup params for a TN GEMM
 template <class TA, class TB, class TC,
           class Alpha, class Beta>
 void
@@ -391,29 +391,29 @@ gemm_tn(int m, int n, int k,
         TC      * C, int ldC,
         cudaStream_t stream = 0)
 {
-  // 定义 shape (动态)
+  // Define shapes (dynamic)
   auto M = int(m);
   auto N = int(n);
   auto K = int(k);
   auto prob_shape = make_shape(M, N, K);                     // (M, N, K)
 
-  // 定义 TN 步长 (混合)
+  // Define TN strides (mixed)
   auto dA = make_stride(ldA, Int<1>{});                      // (dM, dK)
   auto dB = make_stride(ldB, Int<1>{});                      // (dN, dK)
   auto dC = make_stride(Int<1>{}, ldC);                      // (dM, dN)
 
-  // 定义 CTA tile 尺寸 (静态)
+  // Define CTA tile sizes (static)
   auto bM = Int<128>{};
   auto bN = Int<128>{};
   auto bK = Int< 64>{};
   auto cta_tiler = make_shape(bM, bN, bK);                   // (BLK_M, BLK_N, BLK_K)
   auto bP = Int<3>{};  // Pipeline
 
-  // 定义 SMEM layout (静态)
+  // Define the smem layouts (static)
   auto sA = tile_to_shape(GMMA::Layout_K_SW128_Atom<TA>{}, make_shape(bM,bK,bP));
   auto sB = tile_to_shape(GMMA::Layout_K_SW128_Atom<TB>{}, make_shape(bN,bK,bP));
 
-  // 定义线程 layout (静态)
+  // Define the thread layouts (static)
   TiledCopy copyA = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, TA>{},
                                     Layout<Shape<_16,_8>,Stride<_8,_1>>{}, // Thr layout 16x8 k-major
                                     Layout<Shape< _1,_8>>{});              // Val layout  1x8
@@ -436,10 +436,10 @@ gemm_tn(int m, int n, int k,
 #endif
 
   //
-  // 配置与启动
+  // Setup and Launch
   //
 
-  // 启动参数配置
+  // Launch parameter setup
   int smem_size = int(sizeof(SharedStorage<TA, TB, decltype(sA), decltype(sB)>));
   dim3 dimBlock(size(tiled_mma));
   dim3 dimCluster(1, 1, 1);
@@ -459,7 +459,7 @@ gemm_tn(int m, int n, int k,
     cudaFuncAttributeMaxDynamicSharedMemorySize,
     smem_size));
 
-  // Kernel 启动
+  // Kernel Launch
   cutlass::Status status = cutlass::launch_kernel_on_cluster(params, kernel_ptr,
                                                              prob_shape, cta_tiler,
                                                              A, dA, sA, copyA,
@@ -546,7 +546,7 @@ int main(int argc, char** argv)
   thrust::host_vector<TB> h_B(n*k);
   thrust::host_vector<TC> h_C(m*n);
 
-  // 初始化张量
+  // Initialize the tensors
   for (int j = 0; j < m*k; ++j) h_A[j] = TA(int((rand() % 2) ? 1 : -1));
   for (int j = 0; j < n*k; ++j) h_B[j] = TB(int((rand() % 2) ? 1 : -1));
   for (int j = 0; j < m*n; ++j) h_C[j] = TC(0);
@@ -578,7 +578,7 @@ int main(int argc, char** argv)
     assert(false);
   }
 
-  // 运行一次
+  // Run once
   d_C = h_C;
   gemm(transA, transB, m, n, k,
        alpha,
@@ -589,7 +589,7 @@ int main(int argc, char** argv)
   CUTE_CHECK_LAST();
   thrust::host_vector<TC> cute_result = d_C;
 
-  // 计时迭代
+  // Timing iterations
   timer.start();
   for (int i = 0; i < timing_iterations; ++i) {
     gemm(transA, transB, m, n, k,

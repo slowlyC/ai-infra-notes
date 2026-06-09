@@ -38,74 +38,78 @@
 #include "cutlass/util/GPU_Clock.hpp"
 #include "cutlass/util/helper_cuda.hpp"
 
-// 本示例在 `tiled_copy` 基础上, 使用谓词张量保护 `cute::copy_if()` 的内存访问.
-// 从而支持形状不是 block 尺寸整数倍的张量.
+// This example extends `tiled_copy` using predicate tensors to guard memory accesses performed
+// by `cute::copy_if()`. This enables tensors to have shapes that are not integer multiples of
+// block sizes.
 //
-// 实现方式: 实例化一个坐标张量以对应待访问张量元素, 再计算用于掩蔽访问的谓词张量.
-// 示例展示如何用与 GMEM 张量分块相同的 CuTe 操作, 构造包含坐标的恒等张量和包含
-// 掩码位的谓词张量.
+// This is accomplished by instantiating a tensor of coordinates which correspond to tensor elements
+// to be accessed and then computing a predicate tensor which masks accesses. The example demonstrates
+// how constructing of an identity tensor containing coordinates and a predicate tensor containing
+// mask bits can be implemented using the same CuTe operations used to tile the tensors in
+// Global Memory.
 //
-// 本示例实现两种变体:
-//  - copy_if_kernel() 使用 `cute::local_partition()` 构造每个线程的切片
-//  - copy_if_kernel_vectorized() 使用 `make_tiled_copy()` 实现向量化内存访问.
+// This example implements two variants:
+//  - copy_if_kernel() uses `cute::local_partition()` to construct each thread's slice
+//  - copy_if_kernel_vectorized() uses `make_tiled_copy() to implement vectorized memory accesses.
 //
-// 张量形状和步长必须能被向量访问的形状整除.
+// The tensor shapes and strides must be divisible by the shape of the vector access.
 //
 
-/// 简单拷贝核函数.
+/// Simple copy kernel.
 //
-// 使用 local_partition() 将 tile 按 (THR_M, THR_N) 排布的线程进行划分.
+// Uses local_partition() to partition a tile among threads arranged as (THR_M, THR_N).
 template <class TensorS, class TensorD, class BlockShape, class ThreadLayout>
 __global__ void copy_if_kernel(TensorS S, TensorD D, BlockShape block_shape, ThreadLayout)
 {
   using namespace cute;
 
-  // 构造坐标张量, 其元素为访问张量 S 和 D 时所用的坐标.
+  // Construct a coordinate tensor whose elements are the coordinates used to access tensors S and D.
   auto shape_S = shape(S);
   Tensor C = make_identity_tensor(shape_S);
-  // 构造谓词张量: 将坐标与原形状比较.
+  // Construct a predicate tensor which compares the coordinates with the original shape
   Tensor P = cute::lazy::transform(C, [&](auto c) { return elem_less(c, shape_S); });
 
-  // 将输入张量分块
+  // Tile the input tensor into blocks
   auto block_coord = make_coord(blockIdx.x, blockIdx.y);
   Tensor tile_S = local_tile(S, block_shape, block_coord);   // (BlockShape_M, BlockShape_N)
   Tensor tile_D = local_tile(D, block_shape, block_coord);   // (BlockShape_M, BlockShape_N)
   Tensor tile_P = local_tile(P, block_shape, block_coord);   // (BlockShape_M, BlockShape_N)
 
-  // 按给定线程布局, 将 tile 在线程间划分.
+  // Construct a partitioning of the tile among threads with the given thread arrangement.
 
-  // 概念:                            张量    线程布局        线程索引
+  // Concept:                         Tensor  ThrLayout       ThrIndex
   Tensor thr_tile_S = local_partition(tile_S, ThreadLayout{}, threadIdx.x);
   Tensor thr_tile_D = local_partition(tile_D, ThreadLayout{}, threadIdx.x);
   Tensor thr_tile_P = local_partition(tile_P, ThreadLayout{}, threadIdx.x);
 
-  // 使用 `thr_tile_P` 保护访问, 从 GMEM 拷到 GMEM.
+  // Copy from GMEM to GMEM using `thr_tile_P` to guard accesses.
   copy_if(thr_tile_P, thr_tile_S, thr_tile_D);
 }
 
-/// 向量化拷贝核函数.
+/// Vectorized copy kernel.
 ///
-/// 使用 `make_tiled_copy()` 通过向量指令完成拷贝. 前置条件: 指针需按向量尺寸对齐.
+/// Uses `make_tiled_copy()` to perform a copy using vector instructions. This operation
+/// has the precondition that pointers are aligned to the vector size.
 ///
 template <class TensorS, class TensorD, class BlockShape, class Tiled_Copy>
 __global__ void copy_if_kernel_vectorized(TensorS S, TensorD D, BlockShape block_shape, Tiled_Copy tiled_copy)
 {
   using namespace cute;
 
-  // 构造坐标张量, 其元素为访问张量 S 和 D 时所用的坐标.
+  // Construct a coordinate tensor whose elements are the coordinates used to access tensors S and D.
   auto shape_S = shape(S);
   Tensor C = make_identity_tensor(shape_S);
-  // 构造谓词张量: 将坐标与原形状比较.
+  // Construct a predicate tensor which compares the coordinates with the original shape
   Tensor P = cute::lazy::transform(C, [&](auto c) { return elem_less(c, shape_S); });
 
-  // 将输入张量分块
+  // Tile the input tensor into blocks
   auto block_coord = make_coord(blockIdx.x, blockIdx.y);
   Tensor tile_S = local_tile(S, block_shape, block_coord);       // (BlockShape_M, BlockShape_N)
   Tensor tile_D = local_tile(D, block_shape, block_coord);       // (BlockShape_M, BlockShape_N)
   Tensor tile_P = local_tile(P, block_shape, block_coord);       // (BlockShape_M, BlockShape_N)
 
   //
-  // 构造对应每个线程切片的张量.
+  // Construct a Tensor corresponding to each thread's slice.
   //
   ThrCopy thr_copy = tiled_copy.get_thread_slice(threadIdx.x);
   Tensor thr_tile_S = thr_copy.partition_S(tile_S);              // (CPY, CPY_M, CPY_N)
@@ -113,36 +117,36 @@ __global__ void copy_if_kernel_vectorized(TensorS S, TensorD D, BlockShape block
   Tensor thr_tile_P = thr_copy.partition_S(tile_P);              // (CPY, CPY_M, CPY_N)
 
 #if 0
-  // 从 GMEM 拷到 GMEM
+  // Copy from GMEM to GMEM
   copy_if(tiled_copy, thr_tile_P, thr_tile_S, thr_tile_D);
 #else
-  // make_fragment_like() 在 RMEM 中构造与 thr_tile_S 同形状的张量.
+  // make_fragment_like() constructs a tensor in RMEM with the same shape as thr_tile_S.
   Tensor frag = make_fragment_like(thr_tile_S);
 
-  // 从 GMEM 拷到 RMEM, 再从 RMEM 拷到 GMEM
+  // Copy from GMEM to RMEM and from RMEM to GMEM
   copy_if(tiled_copy, thr_tile_P, thr_tile_S, frag);
   copy_if(tiled_copy, thr_tile_P, frag,       thr_tile_D);
 #endif
 }
 
-/// 主函数
+/// Main function
 int main(int argc, char** argv)
 {
   //
-  // 给定二维形状, 执行高效拷贝
+  // Given a 2D shape, perform an efficient copy
   //
 
   using namespace cute;
   using Element = float;
 
-  // 定义动态维度 (m, n) 的张量形状
+  // Define a tensor shape with dynamic extents (m, n)
   auto tensor_shape = make_shape(528, 300);
 
   thrust::host_vector<Element> h_S(size(tensor_shape));
   thrust::host_vector<Element> h_D(size(tensor_shape));
 
   //
-  // 初始化
+  // Initialize
   //
 
   for (size_t i = 0; i < h_S.size(); ++i) {
@@ -155,39 +159,39 @@ int main(int argc, char** argv)
   thrust::device_vector<Element> d_Zero = h_D;
 
   //
-  // 构造张量
+  // Make tensors
   //
 
   Tensor tensor_S = make_tensor(make_gmem_ptr(d_S.data().get()), make_layout(tensor_shape));
   Tensor tensor_D = make_tensor(make_gmem_ptr(d_D.data().get()), make_layout(tensor_shape));
 
   //
-  // 分块
+  // Partition
   //
 
-  // 定义静态尺寸的 block (M, N).
+  // Define a statically sized block (M, N).
   //
-  // 约定: 大写字母表示静态模式.
+  // Note, by convention, capital letters are used to represent static modes.
   auto block_shape = make_shape(Int<128>{}, Int<64>{});
 
-  // 对张量分块: (m, n) ==> ((M, N), m', n'), 其中 (M, N) 为静态 tile 形状,
-  // 模式 (m', n') 为 tile 数量.
+  // Tile the tensor (m, n) ==> ((M, N), m', n') where (M, N) is the static tile
+  // shape, and modes (m', n') correspond to the number of tiles.
   //
-  // 将用于确定 CUDA 核函数的 grid 维度.
+  // These will be used to determine the CUDA kernel grid dimensinos.
   Tensor tiled_tensor_D = tiled_divide(tensor_D, block_shape);        // ((M, N), m', n')
 
-  // 描述线程布局, 并在 tile 'block_shape' 上复制.
+  // Describes the layout of threads which is then replicated to tile 'block_shape.'
   Layout thr_layout = make_layout(make_shape(Int<32>{}, Int< 8>{}));  // (ThrM, ThrN)
 
   //
-  // 确定 grid 与 block 维度
+  // Determine grid and block dimensions
   //
 
-  dim3 gridDim (size<1>(tiled_tensor_D), size<2>(tiled_tensor_D));   // Grid 形状对应模式 m' 与 n'
+  dim3 gridDim (size<1>(tiled_tensor_D), size<2>(tiled_tensor_D));   // Grid shape corresponds to modes m' and n'
   dim3 blockDim(size(thr_layout));
 
   //
-  // 启动核函数
+  // Launch the kernel
   //
 
   // copy_if()
@@ -207,7 +211,7 @@ int main(int argc, char** argv)
   h_D = d_D;
 
   //
-  // 校验
+  // Verification
   //
 
   auto verify = [](thrust::host_vector<Element> const &S, thrust::host_vector<Element> const &D){
@@ -241,31 +245,33 @@ int main(int argc, char** argv)
 
   thrust::copy(d_Zero.begin(), d_Zero.end(), d_D.begin());
 
-  // 构造具有特定访问模式的 TiledCopy.
-  //   该版本使用:
-  //   (1) 线程布局描述线程数量与排布 (如行主序、列主序等),
-  //   (2) 每个线程将访问的值布局.
+  // Construct a TiledCopy with a specific access pattern.
+  //   This version uses a
+  //   (1) Layout-of-Threads to describe the number and arrangement of threads (e.g. row-major, col-major, etc),
+  //   (2) Layout-of-Values that each thread will access.
 
-  // 每个线程的值排布
+  // Value arrangement per thread
   Layout val_layout = make_layout(make_shape(Int<4>{}, Int<1>{}));   // (4,1) -> val_idx
 
-  // 定义 `AccessType`, 控制实际内存访问指令的宽度.
-  using CopyOp = UniversalCopy<uint_byte_t<sizeof(Element) * size(val_layout)>>;     // 特定访问宽度的拷贝指令
-  //using CopyOp = UniversalCopy<cutlass::AlignedArray<Element, size(val_layout)>>;  // 支持多种拷贝策略的通用类型
-  //using CopyOp = AutoVectorizingCopy;                                              // 假定输入最大对齐的自适应宽度指令
+  // Define `AccessType` which controls the size of the actual memory access instruction.
+  using CopyOp = UniversalCopy<uint_byte_t<sizeof(Element) * size(val_layout)>>;     // A very specific access width copy instruction
+  //using CopyOp = UniversalCopy<cutlass::AlignedArray<Element, size(val_layout)>>;  // A more generic type that supports many copy strategies
+  //using CopyOp = AutoVectorizingCopy;                                              // An adaptable-width instruction that assumes maximal alignment of inputs
 
-  // Copy_Atom 对应于施加于 Element 类型张量的一次 CopyOperation.
+  // A Copy_Atom corresponds to one CopyOperation applied to Tensors of type Element.
   using Atom = Copy_Atom<CopyOp, Element>;
 
-  // 构造 tiled copy: 对 copy atoms 做分块.
+  // Construct tiled copy, a tiling of copy atoms.
   //
-  // 注意: 假定向量和线程布局与 GMEM 中的连续数据对齐. 其他线程布局可行,
-  // 但可能导致非合并读取. 其他值布局也可行, 但不相容布局会在编译期报错.
-  TiledCopy tiled_copy = make_tiled_copy(Atom{},             // 访问策略
-                                         thr_layout,         // 线程布局 (如 32x4 列主序)
-                                         val_layout);        // 值布局 (如 4x1)
+  // Note, this assumes the vector and thread layouts are aligned with contigous data
+  // in GMEM. Alternative thread layouts are possible but may result in uncoalesced
+  // reads. Alternative value layouts are also possible, though incompatible layouts
+  // will result in compile time errors.
+  TiledCopy tiled_copy = make_tiled_copy(Atom{},             // Access strategy
+                                         thr_layout,         // thread layout (e.g. 32x4 Col-Major)
+                                         val_layout);        // value layout (e.g. 4x1)
 
-  // 带向量化的 copy_if()
+  // copy_if() with vectorization
   copy_if_kernel_vectorized<<< gridDim, blockDim >>>(
     tensor_S,
     tensor_D,
@@ -288,3 +294,4 @@ int main(int argc, char** argv)
   }
   return 0;
 }
+
