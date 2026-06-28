@@ -223,7 +223,7 @@ gemm_device(ATensor mA,                      // (Gemm_M, Gemm_K)
 
   // TMEM 分配
   // 在 SM100 架构上, 累加器只存放在 tensor memory (TMEM) 中.
-  // ThrMma 的 make_fragment_C() 会创建一个 layout 适合累加器的 TMEM tensor.
+  // ThrMma 的 make_fragment_C() 会创建一个适合累加器 TMEM tensor 的 layout.
   Tensor tCtAcc = cta_mma.make_fragment_C(tCgC);    // (MmaC, NumMma_M, NumMma_N)
 
   uint32_t elect_one_thr  = cute::elect_one_sync();
@@ -366,6 +366,8 @@ void gemm_host_f16xf16_f32_f32_tnt(TypeA const* device_ptr_A, LayoutA layout_A,
   // 创建 TiledMma. make_tiled_mma 以目标指令和可选的指令 layout 为参数,
   // 基于给定 mma 指令创建更大的 TiledMma.
   // 查看 cute/arch/mma_sm100_umma.hpp 可了解所有 tcgen05.mma 指令.
+  // 这里 K 没有作为模板参数传进去，而是在 CUTLASS trait 里推出来:
+  // K = 256 / cute::sizeof_bits<ValTypeA>::value = 256 / 16 = 16
   TiledMMA tiled_mma = make_tiled_mma(SM100_MMA_F16BF16_SS<TypeA, TypeB, TypeC,                 // Mma 的 A, B 和累加器类型
                                                            128, 256,                            // Mma 的 M 和 N 维度
                                                            UMMA::Major::K, UMMA::Major::K>{});  // A 和 B layout
@@ -377,7 +379,7 @@ void gemm_host_f16xf16_f32_f32_tnt(TypeA const* device_ptr_A, LayoutA layout_A,
   //   PermutationMNK: (_,_,_)
   // MMA_Atom
   //   ThrID:      _1:_0
-  //   Shape_MNK:  (_128,_256,_16)                      // MmaM, MmaN, MmaK 指令尺寸
+  //   Shape_MNK:  (_128,_256,_16)                      // 单条 tcgen05.mma atom 的逻辑矩阵尺寸
   //   LayoutA_TV: (_1,(_128,_16)):(_0,(_1,_128))       // TV -> A 矩阵的 MmaCoordinate 映射
   //   LayoutB_TV: (_1,(_256,_16)):(_0,(_1,_256))       // TV -> B 矩阵的 MmaCoordinate 映射
   //   LayoutC_TV: (_1,(_128,_256)):(_0,(_1,_128))      // TV -> C 矩阵的 MmaCoordinate 映射
@@ -385,8 +387,8 @@ void gemm_host_f16xf16_f32_f32_tnt(TypeA const* device_ptr_A, LayoutA layout_A,
   // 定义 MMA tiler 尺寸 (静态)
   auto bM = tile_size<0>(tiled_mma);             // MMA Tile M. 每个 MMA Tile M 使用 1 个 MMA.
   auto bN = tile_size<1>(tiled_mma);             // MMA Tile N. 每个 MMA Tile N 使用 1 个 MMA.
-  auto bK = tile_size<2>(tiled_mma) * Int<4>{};  // MMA Tile K. 每个 MMA Tile K 使用 4 个 MMA. 对 16b 类型, tcgen05.mma 为 K16.
-  auto mma_tiler = make_shape(bM, bN, bK);       // (MMA_M, MMA_N, MMA_K)
+  auto bK = tile_size<2>(tiled_mma) * Int<4>{};  // MMA Tile K. 每个 MMA Tile K 使用 4 个 MMA, 即 64.
+  auto mma_tiler = make_shape(bM, bN, bK);       // (MMA_M, MMA_N, MMA_K) = (128, 256, 64)
 
   // 在 SM90 中, MMA 是 CTA-local 的, 并执行线程级分块.
   // 在 SM100 中, MMA 是 Cluster-local 的, 并执行 CTA 级分块.
@@ -431,8 +433,8 @@ void gemm_host_f16xf16_f32_f32_tnt(TypeA const* device_ptr_A, LayoutA layout_A,
   auto sB_layout = UMMA::tile_to_mma_shape(UMMA::Layout_K_SW128_Atom<TypeB>{}, mma_shape_B);
 
   // 打印并检查本例的 sA_layout 和 sB_layout.
-  print("sA_layout:\t"); print(sA_layout); print("\n");      // sA_layout:   Sw<3,4,3> o smem_ptr[16b](unset) o ((_128,_16),_1,_4):((_64,_1),_0,_16)
-  print("sB_layout:\t"); print(sB_layout); print("\n");      // sB_layout:   Sw<3,4,3> o smem_ptr[16b](unset) o ((_256,_16),_1,_4):((_64,_1),_0,_16)
+  print("sA_layout:\t"); print(sA_layout); print("\n");  // sA_layout: Sw<3,4,3> o smem_ptr[16b](unset) o ((_128,_16),_1,_4):((_64,_1),_0,_16)
+  print("sB_layout:\t"); print(sB_layout); print("\n");  // sB_layout: Sw<3,4,3> o smem_ptr[16b](unset) o ((_256,_16),_1,_4):((_64,_1),_0,_16)
 
   // 现在可以得到 SMEM 分配大小
   using SMEMStorage = SharedStorage<TypeA, TypeB, decltype(sA_layout), decltype(sB_layout)>;
