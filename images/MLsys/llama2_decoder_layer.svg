@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1900" height="620" viewBox="0 0 1900 620">
+<defs>
+<marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+<path d="M2,2 L10,6 L2,10 Z" fill="#173447"/>
+</marker>
+<marker id="arrowResidual" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+<path d="M2,2 L10,6 L2,10 Z" fill="#2b647f"/>
+</marker>
+</defs>
+<rect width="1900" height="620" fill="#ffffff"/>
+<rect x="220" y="70" width="1490" height="450" rx="12" fill="#fbfcfd" stroke="#173447" stroke-width="4"/>
+<rect x="350" y="200" width="160" height="190" rx="20" fill="#eef8e7" stroke="#5aa142" stroke-width="4"/>
+<text x="430" y="304" text-anchor="middle" font-size="26" font-weight="600" fill="#173447">RMSNorm</text>
+<rect x="580" y="200" width="225" height="190" rx="20" fill="#fde6d8" stroke="#de7a42" stroke-width="4"/>
+<text text-anchor="middle" font-size="24" font-weight="600" fill="#173447"><tspan x="692" y="289.12">Self-Attn</tspan><tspan x="692" y="319.12">q/k/v + RoPE</tspan></text>
+<rect x="865" y="200" width="135" height="190" rx="20" fill="#dcefff" stroke="#3a78a1" stroke-width="4"/>
+<text x="932" y="304" text-anchor="middle" font-size="28" font-weight="600" fill="#173447">o_proj</text>
+<circle cx="1060" cy="295" r="34" fill="#b9df8b" stroke="#2e6e32" stroke-width="4"/>
+<text x="1060" y="307" text-anchor="middle" font-size="34" font-weight="600" fill="#173447">+</text>
+<rect x="1140" y="200" width="160" height="190" rx="20" fill="#eef8e7" stroke="#5aa142" stroke-width="4"/>
+<text x="1220" y="304" text-anchor="middle" font-size="26" font-weight="600" fill="#173447">RMSNorm</text>
+<rect x="1370" y="200" width="215" height="190" rx="20" fill="#efe7ff" stroke="#7953b8" stroke-width="4"/>
+<text text-anchor="middle" font-size="24" font-weight="600" fill="#173447"><tspan x="1477" y="289.12">SwiGLU MLP</tspan><tspan x="1477" y="319.12">gate/up/down</tspan></text>
+<circle cx="1650" cy="295" r="34" fill="#b9df8b" stroke="#2e6e32" stroke-width="4"/>
+<text x="1650" y="307" text-anchor="middle" font-size="34" font-weight="600" fill="#173447">+</text>
+<text x="70" y="288" text-anchor="start" font-size="30" font-weight="600" fill="#173447">Input</text>
+<text x="75" y="328" text-anchor="start" font-size="22" font-weight="400" fill="#52616b">h_l</text>
+<text x="1745" y="288" text-anchor="start" font-size="30" font-weight="600" fill="#173447">Output</text>
+<text x="1750" y="328" text-anchor="start" font-size="22" font-weight="400" fill="#52616b">h_{l+1}</text>
+<line x1="170" y1="295" x2="350" y2="295" stroke="#173447" stroke-width="4" marker-end="url(#arrow)"/>
+<line x1="510" y1="295" x2="580" y2="295" stroke="#173447" stroke-width="4" marker-end="url(#arrow)"/>
+<line x1="805" y1="295" x2="865" y2="295" stroke="#173447" stroke-width="4" marker-end="url(#arrow)"/>
+<line x1="1000" y1="295" x2="1026" y2="295" stroke="#173447" stroke-width="4" marker-end="url(#arrow)"/>
+<line x1="1094" y1="295" x2="1140" y2="295" stroke="#173447" stroke-width="4" marker-end="url(#arrow)"/>
+<line x1="1300" y1="295" x2="1370" y2="295" stroke="#173447" stroke-width="4" marker-end="url(#arrow)"/>
+<line x1="1585" y1="295" x2="1616" y2="295" stroke="#173447" stroke-width="4" marker-end="url(#arrow)"/>
+<line x1="1684" y1="295" x2="1740" y2="295" stroke="#173447" stroke-width="4" marker-end="url(#arrow)"/>
+<polyline points="285,295 285,115 1060,115 1060,261" fill="none" stroke="#2b647f" stroke-width="4" marker-end="url(#arrowResidual)"/>
+<polyline points="1060,295 1060,95 1650,95 1650,261" fill="none" stroke="#2b647f" stroke-width="4" marker-end="url(#arrowResidual)"/>
+<text x="430" y="465" text-anchor="start" font-size="22" font-weight="400" fill="#52616b">pre-norm attention block</text>
+<text x="1195" y="465" text-anchor="start" font-size="22" font-weight="400" fill="#52616b">pre-norm feed-forward block</text>
+</svg>
