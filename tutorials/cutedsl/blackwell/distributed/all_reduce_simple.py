@@ -66,33 +66,33 @@ except RuntimeError as exc:
     ) from None
 
 """
-A Distributed All-Reduce Addition Example using CuTe DSL and PyTorch Symmetric Memory.
+使用 CuTe DSL 和 PyTorch Symmetric Memory 的分布式 All-Reduce 加法示例.
 
-This example kernel demonstrates distributed all-reduce across multiple GPUs using the SIMT copy 
-of CuTe DSL and PyTorch's symmetric memory feature. Basic CuTe layout calculation is derived
-from the elementwise_add.py example.
+这个示例 kernel 演示如何结合 CuTe DSL 的 SIMT copy 和 PyTorch symmetric memory,
+在多 GPU 上执行分布式 all-reduce. 基础 CuTe layout 计算来自 elementwise_add.py 示例.
 
-This kernel is a simple version of all-reduce. It will directly copy data from remote memory to 
-registers, then accumulate the data and finally store the accumulated data back to local global memory.
-If the input tensors from each device are remotely accessible, then this kernel can be used to perform the all-reduce.
+这是一个简化版 all-reduce kernel. 它会直接把 remote memory 中的数据 copy 到 registers,
+然后累加数据, 最后把累加结果写回 local global memory.
+如果每个 device 上的 input tensors 都可以被远端访问, 就可以用此 kernel 执行 all-reduce.
 
-On the host side, we use `torch.distributed._symmetric_memory` to manage the symmetric memory. We use `symm_mem.empty`
-and `symm_mem.rendezvous` to create a symmetric tensor. Then we use `get_buffer` to get tensors that are accessible from all devices.
-In this way, we can hide the details of CUDA driver API calls to enable access to remote memory.
+在 host 侧, 可以用 `torch.distributed._symmetric_memory` 管理 symmetric memory.
+通过 `symm_mem.empty` 和 `symm_mem.rendezvous` 创建 symmetric tensor,
+再用 `get_buffer` 获取所有 devices 都可访问的 tensors.
+这样可以隐藏启用 remote memory access 所需的 CUDA driver API 调用细节.
 
 .. code-block:: python
 
     t = symm_mem.empty((M, N), device=torch.device(f"cuda:{rank}"))
     hdl = symm_mem.rendezvous(t, dist.group.WORLD)
-    # get tensors from other devices from the symmetric memory
+    # 从 symmetric memory 获取其它 devices 上的 tensors
     tensor_list = [hdl.get_buffer(rank, t.shape, t.dtype) for rank in range(world_size)]
 
-To run this example:
+运行示例:
 
 .. code-block:: bash
 
-    torchrun --nproc-per-node 8  examples/distributed/all_reduce_simple.py --M 1024 --N 512
-    torchrun --nproc-per-node 8  examples/distributed/all_reduce_simple.py \
+    torchrun --nproc-per-node 8 distributed/all_reduce_simple.py --M 1024 --N 512
+    torchrun --nproc-per-node 8 distributed/all_reduce_simple.py \
         --M 1024 --N 1024 --benchmark --warmup_iterations 2 --iterations 100
 """
 
@@ -107,7 +107,7 @@ def all_reduce_simple_kernel(
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
 
-    # slice for CTAs
+    # 为 CTAs 切分 tile
     # logical id -> address
     blk_coord = ((None, None), bidx)
     local_tile_out = gOut[blk_coord]
@@ -132,13 +132,14 @@ def all_reduce_simple_kernel(
     frg_acc = cute.make_fragment_like(thr_out)
     frg_acc.fill(0.0)
 
-    # load the frg at the same offset from all devices and accumulate the result in frg_acc
+    # 从所有 devices 的相同 offset 加载 frg, 并累加到 frg_acc
+    # 即 frg_acc = 0.0 + rank0_frg + rank1_frg + ...
     for thr, frg in zip(thr_tensor_list, frg_tensor_list):
         cute.copy(copy_atom_load, thr, frg)
         tmp = frg.load() + frg_acc.load()
         frg_acc.store(tmp)
 
-    # copy from register memory to global memory
+    # 从 register memory copy 到 global memory
     cute.copy(copy_atom_store, frg_acc, thr_out)
 
 
@@ -183,9 +184,10 @@ def run_all_reduce_simple(
 
     local_tensor = nvshmem.core.tensor((M, N), dtype=torch.float32)
     local_tensor.random_(0, 100)
+    # peer tensors 是 remote views, 不会在当前 GPU 上复制远端 tensor 数据.
     tensor_list = [nvshmem.core.get_peer_tensor(local_tensor, rank) for rank in range(world_size)]
     output = torch.zeros((M, N), device=f"cuda:{rank}")
-    
+
     if rank == 0:
         print("Compiling kernel with cute.compile ...")
     start_time = time.time()
@@ -237,7 +239,7 @@ def run_all_reduce_simple(
         iterations=iterations,
     )
 
-    # Print execution results
+    # 打印执行结果
     if rank == 0:
         print(f"Kernel execution time: {avg_time_us / 1e3:.4f} ms")
         print(
@@ -251,29 +253,31 @@ def run_all_reduce_simple(
 
 def torchrun_uid_init_bcast():
     """
-    Initialize NVSHMEM using UniqueID with `torchrun` as the launcher
+    使用 UniqueID 初始化 NVSHMEM, 并以 `torchrun` 作为 launcher.
 
-    It uses torch.distributed.broadcast on a NumPy array to handle the broadcasting
+    这里通过 torch.distributed.broadcast 广播 NumPy array.
     """
-    # Set Torch device
+    # 设置 Torch device
     local_rank = int(os.environ['LOCAL_RANK'])
     torch.cuda.set_device(local_rank)
 
-    # nvshmem4py requires a cuda.core Device at init time
+    # nvshmem4py 初始化时需要 cuda.core Device
     dev = Device(local_rank)
     dev.set_current()
     global stream
     stream = dev.create_stream()
 
-    # Initialize torch.distributed process group
+    # 初始化 torch.distributed process group
     dist.init_process_group(
         backend="cpu:gloo,cuda:nccl",
     )
+    if dist.get_rank() == 0:
+        import pdb; pdb.set_trace()
 
-    # Extract rank, nranks from process group
+    # 从 process group 取 rank 和 nranks
     num_ranks = dist.get_world_size()
 
-    # Create an empty uniqueid for all ranks
+    # 为所有 ranks 创建空 uniqueid
     uid = nvshmem.core.get_unique_id(empty=(local_rank != 0))
     uid_bytes = uid._data.view(np.uint8).copy()
     uid_tensor = torch.from_numpy(uid_bytes).cuda()
@@ -291,7 +295,7 @@ def torchrun_finalize():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="example of elementwise add to demonstrate the numpy/pytorch as input for kernels"
+        description="elementwise add 示例, 用于演示 kernel 如何接收 numpy/pytorch 输入"
     )
     parser.add_argument("--M", default=1024, type=int)
     parser.add_argument("--N", default=1024, type=int)

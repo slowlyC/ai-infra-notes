@@ -1,6 +1,6 @@
 # FlashAttention-3 代码分析
 
-前几篇文章[Gluon-0a-Attention-Forward](https://zhuanlan.zhihu.com/p/2011582362362864169) ，[FlashAttention 2 代码分析：Triton 与 CuTile 实现](https://zhuanlan.zhihu.com/p/2014101400808862224) 分析了 FA 的 Triton/CuTile/Gluon 实现，本文来分析 FlashAttention-3 的 CUTLASS 实现，主要基于 [flash-attention](https://github.com/Dao-AILab/flash-attention) commit `eacbc560`，以代码分析为主。原理部分可以见论文
+前几篇文章[FlashAttention 2 代码分析：Triton 实现](https://zhuanlan.zhihu.com/p/2011582362362864169) ，[FlashAttention 2 代码分析：CuTile 实现](https://zhuanlan.zhihu.com/p/2014101400808862224) 分析了 FA 的 Triton 和 CuTile 实现，本文来分析 FlashAttention-3 的 CUTLASS 实现，主要基于 [flash-attention](https://github.com/Dao-AILab/flash-attention) commit `eacbc560`，以代码分析为主。原理部分可以见论文
 
 > Jay Shah et al., *FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-Precision*, 2024.
 
@@ -724,54 +724,10 @@ TensorT finalize(float const final_scale = 1.f) {
 - `sum != sum` 是 NaN 检测（IEEE 754 中 NaN 不等于自身），处理全 mask 场景
 - `row_sum` 被复用：finalize 之后存的不再是 Σexp，而是 LSE (log-sum-exp)，backward pass 需要这个值
 
-## 9. 补充
-
-### 9.1 张量命名约定
-
-CuTe/CUTLASS 中的变量命名有约定：
-
-
-| 前缀  | 含义                   | 示例                             |
-| --- | -------------------- | ------------------------------ |
-| `t` | Tensor (partitioned) | `tOrO` = tensor O, partitioned |
-| `s` | Shared Memory        | `sQ` = Q in smem               |
-| `g` | Global Memory        | `gK` = K in gmem               |
-| `r` | Register             | `tSrS` 中的 `r`                  |
-
-
-变量名读法举例：`tSrS` = **t**ensor **S**cores in **r**egisters for **S**;  `tOrO` = **t**ensor **O**utput in **r**egisters for **O**。第一个字母 `t` 表示这是经过 `partition_fragment_C` 等函数分区后的 tensor，每个线程只持有其中一部分。 
-`tOrO` 累加器为例进行详解
-
-```cpp
-// flash_fwd_kernel_sm90.h Line 418
-
-Tensor tOrO = partition_fragment_C(tiled_mma_pv, select<0, 1>(TileShape_MNK_PV{}));
-```
-
-```
-tOrO 结构:
-
-  名称: tOrO = Tensor O in Registers for Output
-
-  逻辑形状: [128 × 128] (B_r × d)
-  数据类型: FP32 (高精度累加)
-  存储位置: 寄存器 (分布在 256 个 Consumer 线程中)
-
-  生命周期:
-    1. 初始化为 0
-    2. 每次迭代: O_new = α × O_old + P̃ × V
-    3. 最终: O = O / ℓ (归一化)
-    4. 写回 HBM
-
-  分布方式:
-    每个线程持有若干个 8×8 的小块 (由 WGMMA 指令决定)
-```
-
-### 9.2 FP8 低精度支持
+## 9. 补充: FP8 低精度支持
 
 FA3 的一个特性是支持 FP8 精度的 QK/PV GEMM。代码中通过 `Is_FP8` 编译期开关控制，涉及以下处理：
 
 - **Descale**：FP8 量化后需要乘以 descale 因子恢复精度。代码中 `q_descale × k_descale` 被乘到 `softmax_scale_log2` 中，统一在 Softmax 阶段处理，避免额外的 rescale 步骤
 - **Max_offset**：`softmax.h` 中的 `Max_offset` 模板参数（FP8 时为 8）。计算 exp2f 时减去 `max_offset=8`，使输出范围从 [0, 1] 扩展到 [0, 256]，更好地利用 FP8 的表示范围，减少 underflow
 - **Permute**：FP8 WGMMA 对寄存器布局有特殊要求，`permute_Cregs_fp8` 和 `permute_Aregs_fp8` 负责在 GEMM 前后调整寄存器排列
-

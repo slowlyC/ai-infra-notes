@@ -6,7 +6,7 @@
 
 CuTile 版本的算法和 Triton 版本相同，完整推导参考 [Triton 篇](FlashAttention2_Triton.md) 的「1. 算法原理」 部分，这里仅保留必要原理于流程。
 
-forward 过程不计算完整的 N \times N attention matrix，而是固定一个 Q block，流式遍历 K/V blocks，在 SRAM 中维护每行的最大值、指数和与输出累加器：
+forward 过程不计算完整的 $N \times N$ attention matrix，而是固定一个 Q block，流式遍历 K/V blocks，在 SRAM 中维护每行的最大值、指数和与输出累加器：
 
 ```
 for each Q block:

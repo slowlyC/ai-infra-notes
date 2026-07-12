@@ -27,38 +27,37 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 """
-A Distributed All-Reduce Example using TMA (Tensor Memory Accelerator).
+使用 TMA (Tensor Memory Accelerator) 的分布式 All-Reduce 示例.
 
-This example demonstrates distributed all-reduce across multiple GPUs using TMA
-for data movement. It serves as a tutorial for TMA-based distributed operations,
-not as a performance-optimized implementation.
+这个示例演示如何使用 TMA 搬运数据, 在多 GPU 上执行分布式 all-reduce.
+它用于讲解基于 TMA 的分布式操作, 并非面向性能优化的实现.
 
-Tensor Semantics:
-    - Input:  Logical shape (world_size, S), where S is the per-rank tensor size
-    - Output: Logical shape (world_size, S), each rank gets the sum of all inputs
+Tensor 语义:
+    - Input: logical shape 为 (world_size, S), S 是每个 rank 的 tensor 大小
+    - Output: logical shape 为 (world_size, S), 每个 rank 都得到所有 inputs 之和
 
-Kernel Parameters:
-    - input:  List of world_size tensors, each with shape S (accessible via NVSHMEM)
-    - output: Single tensor with shape S, using multicast address for broadcast
+Kernel 参数:
+    - input: 包含 world_size 个 tensors 的 list, 每个 tensor 的 shape 为 S, 可通过 NVSHMEM 访问
+    - output: shape 为 S 的单个 tensor, 使用 multicast address 执行 broadcast
 
-Algorithm (Two-Shot):
-    1. Each CTA loads data from all ranks at its assigned tile position (TMA Load)
-    2. Accumulates the data locally in registers
-    3. Stores the result via TMA multicast (broadcasts to all ranks)
-    4. Cross-GPU barrier ensures completion before kernel exit
+算法 (Two-Shot):
+    1. 每个 CTA 从所有 ranks 加载其负责 tile 位置的数据 (TMA Load)
+    2. 在 registers 中进行本地累加
+    3. 通过 TMA multicast 写出结果, broadcast 到所有 ranks
+    4. cross-GPU barrier 确保 kernel 退出前所有操作均已完成
 
-Tile Assignment:
-    - Total tiles = ceil(S / elems_per_cta)
-    - Each rank processes ceil(total_tiles / world_size) CTAs
-    - CTA i on rank r processes global_tile_id = r * ctas_per_rank + i
+Tile 分配:
+    - total_tiles = ceil(S / elems_per_cta)
+    - 每个 rank 处理 ceil(total_tiles / world_size) 个 CTAs
+    - rank r 上的 CTA i 处理 global_tile_id = r * ctas_per_rank + i
 
-TMA Usage Notes (for tutorial purposes, not perf-optimal):
-    - Uses 1D TMA load to load from remote GPU memory via NVSHMEM addresses
-    - Uses 1D TMA load to store to multicast address for broadcasting to all ranks
-    - Supports any input shape by flattening to 1D and tiling linearly
-    - Pipeline with 2 stages overlaps TMA loads across ranks
+TMA 使用说明 (仅用于教学, 并非性能最优):
+    - 使用 1D TMA load, 通过 NVSHMEM addresses 从 remote GPU memory 加载数据
+    - 使用 1D TMA store 写入 multicast address, 将结果 broadcast 到所有 ranks
+    - 将任意 shape 的 input 展平为 1D 并线性分 tile, 从而支持任意 input shape
+    - 使用 2-stage pipeline 重叠来自不同 ranks 的 TMA loads
 
-To run this example:
+运行示例:
 
 .. code-block:: bash
 
@@ -75,26 +74,26 @@ from cutlass.cute.nvgpu import cpasync
 
 class AllReduceTmaKernel:
     """
-    TMA-based distributed All-Reduce kernel.
+    基于 TMA 的分布式 All-Reduce kernel.
 
-    This kernel performs an all-reduce operation across multiple GPUs using TMA
-    (Tensor Memory Accelerator) for efficient data movement.
+    这个 kernel 使用 TMA (Tensor Memory Accelerator) 高效搬运数据,
+    在多个 GPUs 之间执行 all-reduce.
 
-    Algorithm (Two-Shot):
-        1. Each CTA loads data from all ranks at its assigned tile position
-        2. Accumulates the data locally in registers
-        3. Stores the result via TMA multicast (broadcasts to all ranks)
-        4. Cross-GPU barrier ensures completion before kernel exit
+    算法 (Two-Shot):
+        1. 每个 CTA 从所有 ranks 加载其负责 tile 位置的数据
+        2. 在 registers 中进行本地累加
+        3. 通过 TMA multicast 写出结果, broadcast 到所有 ranks
+        4. cross-GPU barrier 确保 kernel 退出前所有操作均已完成
 
-    The input/output tensors can be of any rank, as long as:
-        - All input tensors and output tensor share the same layout
-        - The layout is compact (no holes in memory)
+    input/output tensors 可以有任意 rank, 但需要满足:
+        - 所有 input tensors 和 output tensor 使用相同 layout
+        - layout 是 compact 的, memory 中没有空洞
 
-    We traverse the tensors linearly in codomain (physical offset) order,
-    which guarantees consistent logical coordinate access across all tensors.
+    我们按照 codomain (physical offset) 顺序线性遍历 tensors,
+    从而保证所有 tensors 的 logical coordinate 访问保持一致.
     """
 
-    _elems_per_cta: int = 128 * 128  # Elements processed per CTA
+    _elems_per_cta: int = 128 * 128  # 每个 CTA 处理的 elements 数量
     _tma_threads: int = 32
     _consumer_threads: int = 128
     _threads_per_cta: int = _tma_threads + _consumer_threads
@@ -103,15 +102,15 @@ class AllReduceTmaKernel:
     def __init__(self, dtype):
         self.dtype = dtype
 
-        # SMEM layout shape (will be converted to Layout in JIT context)
+        # SMEM layout shape, 会在 JIT context 中转换为 Layout
         self.smem_layout_shape = (self._elems_per_cta,)
         self.tiler = (self._elems_per_cta,)
 
-        # TMA transaction bytes (computed from dtype size)
-        # dtype.width is in bits, divide by 8 to get bytes
+        # 根据 dtype 大小计算 TMA transaction bytes
+        # dtype.width 的单位是 bits, 除以 8 得到 bytes
         self.tma_bytes = (dtype.width // 8) * self._elems_per_cta
 
-        # Dynamically create SharedStorage type based on dtype
+        # 根据 dtype 动态创建 SharedStorage type
         elems = self._elems_per_cta
         stages = self._num_stages
 
@@ -136,30 +135,30 @@ class AllReduceTmaKernel:
         world_size: cutlass.Constexpr,
     ):
         """
-        Host-side JIT function: creates TMA descriptors and launches kernel.
+        Host 侧 JIT function: 创建 TMA descriptors 并启动 kernel.
 
-        Args:
-            input_tensors: List of input tensors from each rank (world_size tensors)
-            output_tensor_mc: Output tensor with multicast address
-            flag: Synchronization flag (local view)
-            flag_mc: Synchronization flag (multicast view)
-            local_rank: This rank's ID
-            world_size: Total number of ranks
+        参数:
+            input_tensors: 来自各 rank 的 input tensors list, 共 world_size 个 tensors
+            output_tensor_mc: 使用 multicast address 的 output tensor
+            flag: synchronization flag 的 local view
+            flag_mc: synchronization flag 的 multicast view
+            local_rank: 当前 rank 的 ID
+            world_size: ranks 总数
         """
         # ======================================================================
-        # Layout validation
+        # Layout 校验
         # ======================================================================
         ref_layout = input_tensors[0].layout
         ref_size = cute.size(ref_layout)
         ref_cosize = cute.cosize(ref_layout)
 
-        # Check compact: size == cosize (no holes in memory)
+        # 检查 compact: size == cosize, memory 中没有空洞
         assert ref_size == ref_cosize, (
             f"Input tensor must be compact: size={ref_size}, cosize={ref_cosize}"
         )
         assert self.tma_bytes % 16 == 0, f"Not aligned to 16B, TMA should not be used."
 
-        # Check all input tensors have the same layout
+        # 检查所有 input tensors 是否使用相同 layout
         for i in cutlass.range_constexpr(world_size):
             assert input_tensors[i].layout == ref_layout, (
                 f"All input tensors must have the same layout. "
@@ -167,16 +166,16 @@ class AllReduceTmaKernel:
                 f"input_tensors[{i}].layout={input_tensors[i].layout}"
             )
 
-        # Check output tensor has the same layout
+        # 检查 output tensor 是否使用相同 layout
         assert output_tensor_mc.layout == ref_layout, (
             f"Output tensor must have the same layout as input tensors. "
             f"input layout={ref_layout}, output layout={output_tensor_mc.layout}"
         )
 
         # ======================================================================
-        # Extract tensor info
+        # 提取 tensor 信息
         # ======================================================================
-        # Verify dtype matches
+        # 检查 dtype 是否匹配
         assert input_tensors[0].element_type == self.dtype, (
             f"Input tensor dtype mismatch: expected {self.dtype}, "
             f"got {input_tensors[0].element_type}"
@@ -184,13 +183,13 @@ class AllReduceTmaKernel:
 
         total_elems = ref_size
 
-        # Flatten layout: treat tensor as 1D in codomain order
+        # 展平 layout: 按 codomain 顺序把 tensor 视为 1D
         flat_layout = cute.make_layout((total_elems,))
 
-        # SMEM layout (created in JIT context)
+        # 在 JIT context 中创建 SMEM layout
         smem_layout = cute.make_layout(self.smem_layout_shape)
 
-        # Create TMA load descriptors (one per rank)
+        # 创建 TMA load descriptors, 每个 rank 一个
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp()
         tma_load_atoms = []
         tma_load_tensors = []
@@ -206,7 +205,7 @@ class AllReduceTmaKernel:
             tma_load_atoms.append(tma_atom)
             tma_load_tensors.append(tma_tensor)
 
-        # Create TMA store descriptor
+        # 创建 TMA store descriptor
         tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
         flat_output = cute.make_tensor(output_tensor_mc.iterator, flat_layout)
         tma_store_atom, tma_store_tensor = cpasync.make_tiled_tma_atom(
@@ -216,14 +215,14 @@ class AllReduceTmaKernel:
             self.tiler,
         )
 
-        # Grid calculation
+        # 计算 grid
         num_tiles_total = cute.ceil_div(total_elems, self._elems_per_cta)
         ctas_per_rank = cute.ceil_div(num_tiles_total, world_size)
 
-        # SMEM size from SharedStorage
+        # 从 SharedStorage 获取 SMEM 大小
         smem_bytes = self._SharedStorage.size_in_bytes()
 
-        # Launch kernel
+        # 启动 kernel
         self.kernel(
             tma_load_atoms,
             tma_load_tensors,
@@ -244,24 +243,24 @@ class AllReduceTmaKernel:
     @cute.kernel
     def kernel(
         self,
-        # TMA atoms and tensors for loading from each rank
+        # 用于从各 rank 加载数据的 TMA atoms 和 tensors
         tma_load_atoms: list[cute.CopyAtom],
         tma_load_tensors: list[cute.Tensor],
-        # TMA atom and tensor for storing to multicast address
+        # 用于写入 multicast address 的 TMA atom 和 tensor
         tma_store_atom: cute.CopyAtom,
         tma_store_tensor: cute.Tensor,
         # Synchronization flags
         flag: cute.Tensor,
         flag_mc: cute.Tensor,
-        # Rank info
+        # Rank 信息
         local_rank: cutlass.Constexpr,
         world_size: cutlass.Constexpr,
-        # Grid info for tile calculation
+        # 用于计算 tile 的 grid 信息
         num_tiles_total: cutlass.Constexpr,
         ctas_per_rank: cutlass.Constexpr,
     ):
         # ======================================================================
-        # Thread/Block indexing
+        # Thread/Block 索引
         # ======================================================================
         tidx = cute.arch.thread_idx()[0]
         bidx = cute.arch.block_idx()[0]
@@ -269,7 +268,7 @@ class AllReduceTmaKernel:
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
         # ======================================================================
-        # SMEM allocation
+        # 分配 SMEM
         # ======================================================================
         staged_smem_layout = cute.make_layout((self._elems_per_cta, self._num_stages))
 
@@ -279,7 +278,7 @@ class AllReduceTmaKernel:
         staged_smem_tensor = storage.smem_buffer.get_tensor(staged_smem_layout)
 
         # ======================================================================
-        # TMA Pipeline setup
+        # 配置 TMA Pipeline
         # ======================================================================
         producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 1)
         consumer_group = pipeline.CooperativeGroup(
@@ -299,7 +298,7 @@ class AllReduceTmaKernel:
 
         if global_tile_id < num_tiles_total:
             # ======================================================================
-            # Warp 0: Producer - TMA Load from all ranks
+            # Warp 0: Producer, 从所有 ranks 执行 TMA Load
             # ======================================================================
             if warp_idx == 0:
                 producer_state = pipeline.make_pipeline_state(
@@ -339,7 +338,7 @@ class AllReduceTmaKernel:
                     producer_state.advance()
 
             # ======================================================================
-            # Warp 1-4: Consumer - Load from smem, ADD, Store to smem
+            # Warp 1-4: Consumer, 从 SMEM 加载、ADD, 再写回 SMEM
             # ======================================================================
             else:
                 consumer_tid = tidx - self._tma_threads
@@ -348,7 +347,7 @@ class AllReduceTmaKernel:
                 chunk_size = vec_size * self._consumer_threads
 
                 # ------------------------------------------------------------------
-                # Initialize accumulator using stage 0's layout
+                # 使用 stage 0 的 layout 初始化 accumulator
                 # ------------------------------------------------------------------
                 # (elems, stages) -> (elems,)
                 smem_tensor_wo_stage = cute.slice_(staged_smem_tensor, (None, 0))
@@ -370,7 +369,7 @@ class AllReduceTmaKernel:
                 accum.fill(self.dtype(0.0))
 
                 # ------------------------------------------------------------------
-                # Main loop: load from SMEM and accumulate
+                # 主循环: 从 SMEM 加载并累加
                 # ------------------------------------------------------------------
                 consumer_state = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Consumer, self._num_stages
@@ -402,19 +401,19 @@ class AllReduceTmaKernel:
                     )
                     consumer_state.advance()
 
-                # Store accumulated result back to SMEM (stage 0)
+                # 将累加结果写回 SMEM 的 stage 0
                 per_thread_smem_tensor.store(accum.load())
 
             # ======================================================================
-            # Sync point: all warps meet here
+            # 同步点: 所有 warps 在此会合
             # ======================================================================
             cute.arch.sync_threads()
 
             # ======================================================================
-            # Warp 0: TMA Store to multicast output
+            # Warp 0: 通过 TMA Store 写入 multicast output
             # ======================================================================
             if warp_idx == 0:
-                # Fence to ensure SMEM writes are visible
+                # 使用 fence 确保 SMEM writes 可见
                 cute.arch.fence_proxy("async.shared", space="cta")
 
                 smem_tile_out = cute.slice_(staged_smem_tensor, (None, 0))
@@ -442,7 +441,7 @@ class AllReduceTmaKernel:
                 cute.arch.cp_async_bulk_wait_group(0)
 
         # ==================================================================
-        # Cross-GPU barrier synchronization (thread 0 only)
+        # Cross-GPU barrier 同步, 仅由 thread 0 执行
         # ==================================================================
         if tidx == 0:
             sm_id_linear = (
@@ -453,14 +452,14 @@ class AllReduceTmaKernel:
                 * cute.arch.grid_dim()[1]
             )
 
-            # Signal completion to all ranks
+            # 向所有 ranks 通知当前 CTA 已完成
             utils.distributed.multimem_red_add1(
                 flag_mc.iterator + sm_id_linear,
                 scope="sys",
                 order="release",
             )
 
-            # The same idx ctas wait until all peer ranks' ctas complete
+            # 相同 idx 的 CTAs 等待所有 peer ranks 上对应 CTA 完成
             utils.distributed.spin_lock_atom_cas_relaxed_wait(
                 flag.iterator + sm_id_linear,
                 expected_val=world_size,
@@ -470,7 +469,7 @@ class AllReduceTmaKernel:
 
 
 # =============================================================================
-# HOST-SIDE DRIVER CODE
+# HOST 侧 DRIVER CODE
 # =============================================================================
 
 import os
@@ -509,7 +508,7 @@ except RuntimeError as exc:
 
 
 def torchrun_uid_init_bcast():
-    """Initialize NVSHMEM using UniqueID with torchrun as launcher."""
+    """使用 UniqueID 初始化 NVSHMEM, 并以 torchrun 作为 launcher."""
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
 
@@ -534,7 +533,7 @@ def torchrun_uid_init_bcast():
 
 
 def torchrun_finalize():
-    """Finalize NVSHMEM and destroy process group."""
+    """结束 NVSHMEM 并销毁 process group."""
     nvshmem.core.finalize()
     dist.destroy_process_group()
 
@@ -544,16 +543,16 @@ def run_all_reduce_tma(
     skip_ref_check: bool = False,
 ):
     """
-    Run the TMA-based All-Reduce kernel.
+    运行基于 TMA 的 All-Reduce kernel.
 
-    Args:
-        shape: Tensor shape tuple, e.g., (4, 6, 8, 10)
-        skip_ref_check: If True, skip reference result verification
+    参数:
+        shape: Tensor shape tuple, 例如 (4, 6, 8, 10)
+        skip_ref_check: 为 True 时跳过 reference result 校验
     """
     local_rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
 
-    # Calculate total elements
+    # 计算 elements 总数
     total_elems = math.prod(shape)
 
     if local_rank == 0:
@@ -562,11 +561,11 @@ def run_all_reduce_tma(
         print(f"  Total elements: {total_elems}")
         print(f"  GPU count: {world_size}")
 
-    # Allocate input tensor (symmetric memory, accessible from all ranks)
+    # 分配所有 ranks 均可访问的 symmetric input tensor
     local_input_tensor = nvshmem.core.tensor(shape, dtype=torch.float32)
     local_input_tensor.random_(0, 100)
 
-    # Get peer tensors (views into each rank's input)
+    # 获取 peer tensors, 即各 rank input 的 views
     peer_input_tensors = [
         nvshmem.core.get_peer_tensor(local_input_tensor, r) for r in range(world_size)
     ]
@@ -574,15 +573,15 @@ def run_all_reduce_tma(
     if local_rank == 0:
         print(f"  Input tensor ptr: {local_input_tensor.data_ptr():#x}")
 
-    # Allocate output tensor with multicast address
+    # 分配使用 multicast address 的 output tensor
     local_output_tensor = nvshmem.core.tensor(shape, dtype=torch.float32)
     local_output_tensor.fill_(0)
     output_tensor_mc = nvshmem.core.get_multicast_tensor(
         nvshmem.core.Teams.TEAM_NODE, local_output_tensor
     )
 
-    # Allocate synchronization flags
-    # Flag size = ctas_per_rank (matches kernel's bidx indexing)
+    # 分配 synchronization flags
+    # Flag 大小为 ctas_per_rank, 与 kernel 的 bidx 索引对应
     elems_per_cta = AllReduceTmaKernel._elems_per_cta
     num_tiles = (total_elems + elems_per_cta - 1) // elems_per_cta
     ctas_per_rank = (num_tiles + world_size - 1) // world_size
@@ -597,7 +596,7 @@ def run_all_reduce_tma(
         print(f"  CTAs per rank: {ctas_per_rank}")
         print("Compiling kernel...")
 
-    # Create kernel instance and compile
+    # 创建 kernel instance 并编译
     kernel = AllReduceTmaKernel(cutlass.Float32)
 
     compiled_func = cute.compile(
@@ -629,16 +628,16 @@ def run_all_reduce_tma(
         if local_rank == 0:
             print("Verifying results...")
 
-        # Compute expected result: sum of all inputs
+        # 计算期望结果, 即所有 inputs 之和
         expected = sum([t.cpu() for t in peer_input_tensors])
 
-        # Compare with actual output
+        # 与实际 output 比较
         torch.testing.assert_close(expected, local_output_tensor.cpu())
 
         if local_rank == 0:
             print("Results verified successfully!")
 
-    # Cleanup
+    # 释放资源
     for i in range(world_size):
         if i != local_rank:
             nvshmem.core.free_tensor(peer_input_tensors[i])
@@ -652,8 +651,8 @@ def run_all_reduce_tma(
 
 def parse_shape(shape_str: str) -> tuple:
     """
-    Parse shape string into tuple.
-    Examples:
+    将 shape string 解析为 tuple.
+    示例:
         "1024,1024" -> (1024, 1024)
         "2,3,4,5,6,7,8" -> (2, 3, 4, 5, 6, 7, 8)
     """
@@ -662,18 +661,18 @@ def parse_shape(shape_str: str) -> tuple:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="TMA-based distributed all-reduce example"
+        description="基于 TMA 的分布式 all-reduce 示例"
     )
     parser.add_argument(
         "--shape",
         default="1024,1024",
         type=str,
-        help="Tensor shape as comma-separated values, e.g., '1024,1024' or 4,6,8,10,12'",
+        help="以逗号分隔的 Tensor shape, 例如 '1024,1024' 或 '4,6,8,10,12'",
     )
     parser.add_argument(
         "--skip_ref_check",
         action="store_true",
-        help="Skip reference result verification",
+        help="跳过 reference result 校验",
     )
 
     args = parser.parse_args()

@@ -2,7 +2,7 @@
 
 ### 前言
 
-本文是 Gluon 系列的综合实战篇，基于官方仓库的 [Attention Forward](https://github.com/triton-lang/triton/blob/main/python/tutorials/gluon/xx-attention-forward.py) 实现整理，在原文基础上做了结构重组，并补充了 CUDA 编程模型和 GPU 硬件架构层面的中文注释。
+近期FlashAttention-4正式发布，本文来介绍下 Gluon 的 Flash Attention 实现，其原理与 Flash Attention 4 相似。本文基于 Gluon 官方仓库的 Attention Forward ，在此基础上整理并补充了 CUDA 编程模型和 GPU 硬件架构层面的中文注释。
 
 > 知乎专栏：[DSL教程](https://www.zhihu.com/column/c_1990516179064858333)
 > 完整代码：[GitHub](https://github.com/slowlyC/ai-infra-notes/tree/main/tutorials/gluon)
@@ -20,7 +20,7 @@
 - [Gluon-11-tcgen05-mma-scaled](https://zhuanlan.zhihu.com/p/2003603119259550000)
 - **Gluon-0a-Attention Forward**（本文）
 
-本文实现了一个面向 Blackwell GPU 的高性能 Flash Attention Forward kernel，综合运用了前面教程中介绍的几乎所有 Gluon 高级特性：TMA 异步拷贝、tcgen05 MMA、Tensor Memory、Warp Specialization、Channel 通信、Persistent Kernel 等。可以说，这是整个 Gluon 系列的"集大成"之作。
+本文实现了一个面向 Blackwell GPU 的高性能 Flash Attention Forward kernel，综合运用了前面教程中介绍的几乎所有 Gluon 高级特性：TMA 异步拷贝、tcgen05 MMA、Tensor Memory、Warp Specialization、Channel 通信、Persistent Kernel 等。
 
 ### 原理
 
@@ -34,7 +34,7 @@ $$O = \text{softmax}(QK^T \cdot \text{scale}) \cdot V$$
 
 #### Warp Specialization 架构
 
-本 kernel 采用 6 个专用分区（Warp Group），每个分区负责不同的计算任务，通过 Channel 进行异步通信：
+本 kernel 与 FA4 类似，采用 6 个 Warp 分区（（Warp Group），每个分区负责不同的计算任务，通过 Channel 进行异步通信：
 
 ```
    Warp Specialization 架构：
@@ -107,7 +107,7 @@ Channel 是本 kernel 中分区间通信的抽象，基于循环缓冲区 + mbar
 
 Channel 分为两种：`SharedMemoryChannel`（数据在 SMEM）和 `TensorMemoryChannel`（数据在 TMEM）。
 
-#### 优化技术
+#### 相关优化技术
 
 **1. 位掩码 Causal Mask**
 
@@ -338,7 +338,7 @@ def issue_async_tma_load(smem, bar, desc, offset):
     tma.async_copy_global_to_shared(desc, [offset, 0], bar, smem)
 ```
 
-#### Attention Kernel 逻辑
+#### Kernel 实现
 
 这部分包含 Attention 的配置（`AttentionConfig`）、Tile 调度（`ProgramScheduler`）、以及 6 个 Warp Specialization 分区的完整实现。代码中已通过注释和 ASCII 图示详细解释了 causal mask 的位掩码构造、float2 SIMD 优化、split_n / join_n 操作等技术。
 

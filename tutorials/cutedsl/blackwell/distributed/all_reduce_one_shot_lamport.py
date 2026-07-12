@@ -32,28 +32,29 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import testing
+import cutlass.cute.testing as testing
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T
 from cutlass._mlir.dialects import vector
 
 """
-A Distributed One-Shot All-Reduce Example using CuTe DSL and fine-grained memory control. This is a mirrored version of the 
-existing tensorrt_llm kernel:
+使用 CuTe DSL 和细粒度内存控制实现的分布式 One-Shot All-Reduce 示例.
+这是现有 tensorrt_llm kernel 的镜像版本:
 https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.cu
 
-This example kernel demonstrates a one-shot all-reduce operation using the CuTe DSL with fine-grained memory control.
-It uses dedicated communication buffers for data exchange, and these buffers act as ping-pong buffers. During the 
-process, the kernel uses one buffer for communication and initializes the next buffer to all negative zeros.
+这个示例 kernel 演示如何用 CuTe DSL 和细粒度内存控制执行 one-shot all-reduce.
+它使用专用 communication buffers 交换数据, 这些 buffers 作为 ping-pong buffers.
+执行过程中, kernel 使用一个 buffer 做通信, 并把下一个 buffer 初始化为 negative zero.
 
-In this kernel, each thread is only responsible for 128bits of data. The kernel will write it's local data to every
-buffer at different ranks, then read the data from the local rank buffer. The buffer itself behaves as a barrier, 
-if kernel read negtive 0, then it means data are not ready or not visible yet so that the kernel will read the data again.
+在这个 kernel 中, 每个 thread 只负责 128bits 数据.
+kernel 会把本地数据写到不同 ranks 的每个 buffer, 然后从 local rank buffer 读取数据.
+buffer 本身起到 barrier 的作用, 如果 kernel 读到 negative zero, 表示数据还没 ready 或还不可见,
+kernel 会重新读取该数据.
 
-If the input tensors from each device are not remotely accessible, this kernel can be used to perform the one-shot all-reduce 
-since it uses communication buffers for data exchange.
+如果每个 device 上的 input tensors 不能被远端访问, 可以使用这个 kernel 执行 one-shot all-reduce,
+因为它通过 communication buffers 交换数据.
 
-The .SYS memory scope and .VOLATILE memory order are used to ensure that the data will be visible at the system scope.
+这里使用 .SYS memory scope 和 .VOLATILE memory order, 确保数据在 system scope 可见.
 
 .. code-block:: bash
 
@@ -79,8 +80,8 @@ class AllReduceOneShotLamportKernel:
         stream: cuda.CUstream,
     ):
         copy_bits = 128
-        dtype = local_input.element_type
-        vector_size = copy_bits // dtype.width
+        dtype = local_input.element_type  # 32
+        vector_size = copy_bits // dtype.width  # 128 / 32 = 4
 
         thr_layout = cute.make_ordered_layout((4, 32), order=(1, 0))
         val_layout = cute.make_ordered_layout((1, vector_size), order=(1, 0))
@@ -108,7 +109,35 @@ class AllReduceOneShotLamportKernel:
             stream=stream,
         )
 
-    #  GPU device kernel
+    # 每个 CTA tile 的通信流程:
+    #
+    # signal -> ping, 本轮通信 slot
+    #        -> pong, 下一轮清理 slot
+    #
+    # local buffer[dst=rank][src=all][pong] <- -0.0
+    #
+    # local_input -> frg_in(register)
+    #                     |
+    #                     v
+    #     fan-out R2G 写入各 rank 的 symmetric buffers
+    #                     |
+    #                     +-> buffer[dst=0][src=rank][ping]
+    #                     +-> ...
+    #                     +-> buffer[dst=world_size-1][src=rank][ping]
+    #
+    # 当前 rank 遍历所有的 symmetric buffers, 并累加数据
+    # for i in range_constexpr(len(buffers)):
+    #     buffer[dst=rank][src=i][ping]
+    #                      |
+    #                      v
+    #            轮询直到不再是 -0.0
+    #                      |
+    #                      v
+    #           frg_acc += src payload
+    #
+    # frg_acc(register) -> local_output
+    #
+    # GPU device kernel
     @cute.kernel
     def kernel(
         self,
@@ -139,7 +168,7 @@ class AllReduceOneShotLamportKernel:
         write_coord = (((None, None), rank, ping), bidx)
         write_buffers = [buffer[write_coord] for buffer in buffers]
 
-        # assume all buffers have the same element type with input
+        # 假设所有 buffers 和 input 有相同 element type
         copy_atom_load = cute.make_copy_atom(
             cute.nvgpu.CopyG2ROp(),
             buffers[0].element_type,
@@ -172,7 +201,7 @@ class AllReduceOneShotLamportKernel:
         frg_acc = cute.make_fragment_like(thr_out)
         frg_acc.fill(0.0)
 
-        # clear a next buffer to be all negtive 0
+        # 把下一个 buffer 清成 negative zero
         clear_tensor = frg_clear.load()
         frg_size = cute.size(clear_tensor.shape)
         neg0_i32_vec = cute.full_like(clear_tensor, 0x80000000, cutlass.Int32)
@@ -183,10 +212,10 @@ class AllReduceOneShotLamportKernel:
         frg_clear.store(neg0_f32_tensor)
         cute.copy(copy_atom_store, frg_clear, thr_clear_buffer)
 
-        # read local data to the register
+        # 读取 local data 到 register
         cute.copy(copy_atom_load, thr_in, frg_in)
 
-        # write local data to every buffer at different ranks
+        # 把 local data 写到不同 ranks 的每个 symmetric buffer
         for thr_write_buffer in thr_write_buffer_list:
             cute.copy(copy_atom_store, frg_in, thr_write_buffer)
 
@@ -195,7 +224,7 @@ class AllReduceOneShotLamportKernel:
         )
         frg_in_size = cute.size(frg_in.shape)
 
-        # loop over each buffer and accumulate the data
+        # 遍历每个 buffer 并累加数据
         for i in cutlass.range_constexpr(len(buffers)):
             read_coord = (None, 0, 0, i)
             cute.copy(copy_atom_load, thr_read_buffer[read_coord], frg_in[None, 0, 0])
@@ -212,7 +241,7 @@ class AllReduceOneShotLamportKernel:
                     cutlass.Boolean,
                 )
             )
-            # if the data is negtive 0, it means data are not ready or not visible yet, so we need to read the data again
+            # 如果数据是 negative zero, 表示数据还没 ready 或还不可见, 需要重新读取
             while not isNotNeg0:
                 cute.copy(
                     copy_atom_load, thr_read_buffer[read_coord], frg_in[None, 0, 0]
@@ -254,7 +283,7 @@ def run_all_reduce_one_shot(
         print(f"Tensor dimensions: [{M}, {N}]")
         print(f"GPU count: {world_size}")
 
-    # init buffer tensors to be neg 0
+    # 每个 rank 额外显存开销为 PING_PONG_SIZE * world_size * M * N * dtype_size.
     t = symm_mem.empty(
         [
             PING_PONG_SIZE,
@@ -268,7 +297,7 @@ def run_all_reduce_one_shot(
     buffer_tensor_list = [
         hdl.get_buffer(rank, t.shape, t.dtype).permute(2, 3, 1, 0)
         for rank in range(world_size)
-    ]
+    ]  # buffer[M, N, src_rank, slot]
     signal = cutlass.Int32(0)
     input_tensor = torch.randn([M, N], device=f"cuda:{rank}")
     output_tensor = torch.zeros([M, N], device=f"cuda:{rank}")
@@ -315,7 +344,7 @@ def run_all_reduce_one_shot(
             device="cuda",
         ).neg_()
         hdl = symm_mem.rendezvous(t, group=dist.group.WORLD.group_name)
-        # get tensors from other devices from the symmetric memory
+        # 从 symmetric memory 获取其它 devices 上的 tensors
         buffers = [
             hdl.get_buffer(rank, t.shape, t.dtype).permute(2, 1, 0)
             for rank in range(world_size)
@@ -331,9 +360,9 @@ def run_all_reduce_one_shot(
             stream=stream,
         )
         ja._hdl = (
-            hdl  # in order to extend the life cycle of hdl for the kernel execution
+            hdl  # 延长 hdl 生命周期, 覆盖 kernel 执行期间
         )
-        ja._t = t  # same reason
+        ja._t = t  # 同上
         return ja
 
     avg_time_us = testing.benchmark(
@@ -344,7 +373,7 @@ def run_all_reduce_one_shot(
         iterations=iterations,
     )
 
-    # Print execution results
+    # 打印执行结果
     if rank == 0:
         print(f"Kernel execution time: {avg_time_us / 1e3:.4f} ms")
         print(
@@ -388,7 +417,7 @@ def run(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="example of elementwise add to demonstrate the numpy/pytorch as input for kernels"
+        description="elementwise add 示例, 用于演示 kernel 如何接收 numpy/pytorch 输入"
     )
     parser.add_argument("--M", default=1024, type=int)
     parser.add_argument("--N", default=1024, type=int)

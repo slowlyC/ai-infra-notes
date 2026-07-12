@@ -73,38 +73,32 @@ except RuntimeError as exc:
     ) from None
 
 """
-A high-performance distributed persistent batched dense GEMM example for the NVIDIA Blackwell SM100 architecture
-using CUTE DSL.
-- Matrix A is MxKxL, L is batch dimension, A can be row-major("K") or column-major("M")
-- Matrix B is NxKxL, L is batch dimension, B can be row-major("N") or column-major("K")
-- Matrix C is MxNxL, L is batch dimension, C can be row-major("N") or column-major("M")
-- Matrix C_mc is a multicast C matrix that changes can be broadcasted to all GPUs by multimem instructions.
+使用 CUTE DSL、面向 NVIDIA Blackwell SM100 架构的高性能 distributed persistent batched dense GEMM 示例.
+- Matrix A 为 MxKxL, L 是 batch dimension, A 可以是 row-major ("K") 或 column-major ("M")
+- Matrix B 为 NxKxL, L 是 batch dimension, B 可以是 row-major ("N") 或 column-major ("K")
+- Matrix C 为 MxNxL, L 是 batch dimension, C 可以是 row-major ("N") 或 column-major ("M")
+- Matrix C_mc 是 multicast C matrix, 可通过 multimem instructions 将修改 broadcast 到所有 GPUs.
 
-This GEMM kernel supports the following features:
-    - Utilizes Tensor Memory Access (TMA) for efficient memory operations
-    - Utilizes Blackwell's tcgen05.mma for matrix multiply-accumulate (MMA) operations (including 2cta mma instructions)
-    - Implements TMA multicast with cluster to reduce L2 memory traffic
-    - Support persistent tile scheduling to better overlap memory load/store with mma between tiles
-    - Support warp specialization to avoid explicit pipelining between mainloop load and mma
-    - Support all-reduce epilogue with multimem instructions to distribute the workload to all GPUs
+这个 GEMM kernel 支持 TMA、Blackwell tcgen05.mma (包括 2CTA MMA instructions)、
+结合 cluster 的 TMA multicast、persistent tile scheduling 和 warp specialization.
+它还支持使用 multimem instructions 的 reduce-scatter epilogue, 将工作分配到所有 GPUs.
 
-This GEMM works as follows:
-1. DMA warp: Load A and B matrices from global memory (GMEM) to shared memory (SMEM) using TMA operations.
-2. MMA warp: Perform matrix multiply-accumulate (MMA) operations using tcgen05.mma instruction.
+GEMM 的执行过程如下:
+1. DMA warp: 使用 TMA 将 matrices A 和 B 从 global memory (GMEM) 加载到 shared memory (SMEM).
+2. MMA warp: 使用 tcgen05.mma instruction 执行 matrix multiply-accumulate (MMA).
 3. EPILOGUE warp:
-    - Load completed accumulator from tensor memory (TMEM) to registers (RMEM) using tcgen05.ld.
-    - Type convert C matrix to output type.
-    - Optionally store C matrix from registers (RMEM) to shared memory (SMEM) to global memory (GMEM) with TMA operations,
-      or directly store C matrix from registers (RMEM) to global memory (GMEM) without TMA operations.
-    - Optionally accept an elementwise lambda function epilogue_op to apply to the output tensor:
-      e.g., relu can set epilogue_op = lambda x: cute.where(x > 0, x, cute.full_like(x, 0))
-4. Reduce scatter epilogue:
-    - Load and reduce the 128bit data from all ranks by multimem instructions.
-    - Broadcast the reduced data to all ranks by multimem instructions.
-    - current implementation only supports two_shot all-reduce which means each rank only computes a portion of 
-      the output tensor and broadcast the result to all ranks.
-    - the all-reduce epilogue is only supported when use_tma_store is True.
-    - the all-reduce epilogue is only supported when c_dtype is Float16, Float32, BFloat16, Float8E4M3FN, Float8E5M2.
+    - 使用 tcgen05.ld 将完成的 accumulator 从 tensor memory (TMEM) 加载到 registers (RMEM).
+    - 将 matrix C 转换为 output type.
+    - 可以通过 TMA 将 matrix C 从 registers (RMEM) 写入 shared memory (SMEM), 再写入 global memory (GMEM),
+      也可以不使用 TMA, 直接将 matrix C 从 RMEM 写入 GMEM.
+    - 可以传入 elementwise lambda function `epilogue_op` 作用于 output tensor:
+      例如 relu 可设为 `lambda x: cute.where(x > 0, x, cute.full_like(x, 0))`.
+4. Reduce-scatter epilogue:
+    - 使用 multimem instructions 从所有 ranks 加载并归约 128-bit 数据
+    - 使用 multimem instructions 将归约结果写入对应 rank 的 output 分片
+    - 当前仅支持 two_shot, 即每个 rank 只计算 output tensor 的一部分
+    - 仅当 use_tma_store=True 时支持 reduce-scatter epilogue
+    - c_dtype 仅支持 Float16、Float32、BFloat16、Float8E4M3FN、Float8E5M2
 
 SM100 tcgen05.mma instructions operate as follows:
 - Read matrix A from SMEM
@@ -112,7 +106,7 @@ SM100 tcgen05.mma instructions operate as follows:
 - Write accumulator to TMEM
 The accumulator in TMEM must then be loaded to registers before writing back to GMEM.
 
-Input arguments to this example is same as dense_gemm.py.
+本示例的 input arguments 与 dense_gemm.py 相同.
 
 .. code-block:: bash
 
@@ -122,7 +116,7 @@ Input arguments to this example is same as dense_gemm.py.
       --mnkl 16384,4080,4096,1 --warmup_iterations 3 --iterations 10                                                                               \
       --use_tma_store --use_2cta_instrs --reduce_scatter two_shot 
 
-To collect performance with NSYS profiler:
+使用 NSYS profiler 收集性能数据:
 
 .. code-block:: bash
 
@@ -135,68 +129,68 @@ To collect performance with NSYS profiler:
       --reduce_scatter two_shot
 
 
-Constraints are same as dense_gemm_persistent.py:
-* Supported input data types: fp16, bf16, tf32, int8, uint8, fp8 (e4m3fn, e5m2),
-  see detailed valid dtype combinations in below PersistentDenseGemmKernel class documentation
-* A/B tensor must have the same data type
-* Mma tiler M must be 64/128 (use_2cta_instrs=False) or 128/256 (use_2cta_instrs=True)
-* Mma tiler N must be 32-256, step 32
-* Cluster shape M/N must be positive and power of 2, total cluster size <= 16
-* Cluster shape M must be multiple of 2 if use_2cta_instrs=True
-* The contiguous dimension of A/B/C tensors must be at least 16 bytes aligned,
-  i.e, number of elements is a multiple of 4, 8, and 16 for TFloat32,
-  Float16/BFloat16, and Int8/Uint8/Float8, respectively.
-* OOB tiles are not allowed when TMA store is disabled
-* when reduce_scatter, M must be multiple of 128, world_size must be 2, 4, 8
+约束与 dense_gemm_persistent.py 相同:
+* 支持的 input data types: fp16、bf16、tf32、int8、uint8、fp8 (e4m3fn、e5m2),
+  有效 dtype 组合详见下方 PersistentDenseGemmKernel class 文档
+* A/B tensors 必须使用相同 data type
+* MMA tiler M 必须为 64/128 (use_2cta_instrs=False) 或 128/256 (use_2cta_instrs=True)
+* MMA tiler N 必须在 32-256 范围内, 步长为 32
+* Cluster shape M/N 必须是正的 2 的幂, cluster size 总数不超过 16
+* use_2cta_instrs=True 时, Cluster shape M 必须是 2 的倍数
+* A/B/C tensors 的 contiguous dimension 必须至少按 16 bytes 对齐,
+  即对 TFloat32、Float16/BFloat16、Int8/Uint8/Float8,
+  elements 数量必须分别是 4、8、16 的倍数.
+* 禁用 TMA store 时不允许 OOB tiles
+* 使用 reduce_scatter 时, M 必须是 128 的倍数, world_size 必须为 2、4 或 8
 
 """
 
 
 class PersistentDenseGemmKernel:
     """This class implements batched matrix multiplication (C = A x B) with support for various data types
-    and architectural features specific to Blackwell GPUs with persistent tile scheduling and warp specialization.
+    并使用 Blackwell GPU 特有的 persistent tile scheduling 和 warp specialization.
 
-    :param acc_dtype: Data type for accumulation during computation
+    :param acc_dtype: 计算期间用于 accumulation 的 data type
     :type acc_dtype: type[cutlass.Numeric]
-    :param use_2cta_instrs: Whether to use CTA group 2 for advanced thread cooperation
+    :param use_2cta_instrs: 是否使用 CTA group 2 进行 thread cooperation
     :type use_2cta_instrs: bool
-    :param mma_tiler_mn: Shape of the Matrix Multiply-Accumulate (MMA) tile (M,N)
+    :param mma_tiler_mn: Matrix Multiply-Accumulate (MMA) tile 的 shape (M,N)
     :type mma_tiler_mn: Tuple[int, int]
-    :param cluster_shape_mn: Cluster dimensions (M,N) for parallel processing
+    :param cluster_shape_mn: 用于 parallel processing 的 cluster dimensions (M,N)
     :type cluster_shape_mn: Tuple[int, int]
-    :param use_tma_store: Whether to use Tensor Memory Access (TMA) for storing results
+    :param use_tma_store: 是否使用 Tensor Memory Access (TMA) 写出结果
     :type use_tma_store: bool
     :param reduce_scatter: reduce scatter mode, can be "two_shot"
     :type reduce_scatter: str
 
-    :note: In current version, A and B tensor must have the same data type
-        - i.e., Float8E4M3FN for A and Float8E5M2 for B is not supported
+    :note: 当前版本要求 A 和 B tensors 使用相同 data type
+        - 例如不支持 A 为 Float8E4M3FN、B 为 Float8E5M2
 
-    :note: Supported A/B data types:
+    :note: 支持的 A/B data types:
         - TFloat32
         - Float16/BFloat16
         - Int8/Uint8
         - Float8E4M3FN/Float8E5M2
 
-    :note: Supported accumulator data types:
-        - Float32 (for all floating point A/B data types)
-        - Float16 (only for fp16 and fp8 A/B data types)
-        - Int32 (only for uint8/int8 A/B data types)
+    :note: 支持的 accumulator data types:
+        - Float32, 支持所有 floating-point A/B data types
+        - Float16, 仅支持 fp16 和 fp8 A/B data types
+        - Int32, 仅支持 uint8/int8 A/B data types
 
-    :note: Supported C data types:
-        - Float32 (for float32 and int32 accumulator data types)
-        - Int32 (for float32 and int32 accumulator data types)
-        - Float16/BFloat16 (for fp16 and fp8 accumulator data types)
-        - Int8/Uint8 (for uint8/int8 accumulator data types)
-        - Float8E4M3FN/Float8E5M2 (for float32 accumulator data types)
+    :note: 支持的 C data types:
+        - Float32, 用于 float32 和 int32 accumulator data types
+        - Int32, 用于 float32 和 int32 accumulator data types
+        - Float16/BFloat16, 用于 fp16 和 fp8 accumulator data types
+        - Int8/Uint8, 用于 uint8/int8 accumulator data types
+        - Float8E4M3FN/Float8E5M2, 用于 float32 accumulator data types
 
-    :note: Constraints:
+    :note: 约束:
         - MMA tiler M must be 64/128 (use_2cta_instrs=False) or 128/256 (use_2cta_instrs=True)
         - MMA tiler N must be 32-256, step 32
         - Cluster shape M must be multiple of 2 if use_2cta_instrs=True
         - Cluster shape M/N must be positive and power of 2, total cluster size <= 16
 
-    Example:
+    示例:
         >>> gemm = PersistentDenseGemmKernel(
         ...     acc_dtype=cutlass.Float32,
         ...     use_2cta_instrs=True,
@@ -217,7 +211,7 @@ class PersistentDenseGemmKernel:
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
-        This configuration includes several key aspects:
+        配置包括以下部分:
 
         1.  MMA Instruction Settings (tcgen05):
             - acc_dtype: Data types for MMA accumulator.
@@ -231,13 +225,13 @@ class PersistentDenseGemmKernel:
         3. Output C tensor store mode:
             - use_tma_store: Boolean indicating whether to use Tensor Memory Access (TMA) for storing results.
 
-        :param acc_dtype: Data type of the accumulator.
+        :param acc_dtype: accumulator 的 data type.
         :type acc_dtype: type[cutlass.Numeric]
-        :param mma_tiler_mn: Tuple (M, N) shape of the MMA instruction.
+        :param mma_tiler_mn: MMA instruction 的 Tuple (M,N) shape.
         :type mma_tiler_mn: Tuple[int, int]
         :param use_2cta_instrs: Boolean, True to use cta_group=2 MMA variant.
         :type use_2cta_instrs: bool
-        :param cluster_shape_mn: Tuple (ClusterM, ClusterN) shape of the cluster.
+        :param cluster_shape_mn: cluster 的 Tuple (ClusterM,ClusterN) shape.
         :type cluster_shape_mn: Tuple[int, int]
         :param use_tma_store: Use Tensor Memory Access (TMA) or normal store for output C tensor.
         :type use_tma_store: bool
@@ -248,7 +242,7 @@ class PersistentDenseGemmKernel:
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
         self.cluster_shape_mn = cluster_shape_mn
-        # K dimension is deferred in _setup_attributes
+        # K dimension 延后到 _setup_attributes 中确定
         self.mma_tiler_mn = mma_tiler_mn
         self.mma_tiler = (*mma_tiler_mn, 1)
         self.use_tma_store = use_tma_store
@@ -260,7 +254,7 @@ class PersistentDenseGemmKernel:
         self.reduce_scatter = reduce_scatter
 
         self.occupancy = 1
-        # Set specialized warp ids
+        # 设置 specialized warp ids
         self.epilog_warp_id = (
             0,
             1,
@@ -279,7 +273,7 @@ class PersistentDenseGemmKernel:
                 *self.reduce_scatter_warp_id,
             )
         )
-        # Set barrier id for cta sync, epilogue sync and tmem ptr sync
+        # 设置用于 CTA sync、epilogue sync 和 TMEM pointer sync 的 barrier id
         self.cta_sync_bar_id = 0
         self.epilog_sync_bar_id = 1
         self.tmem_ptr_sync_bar_id = 2
@@ -306,18 +300,18 @@ class PersistentDenseGemmKernel:
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
 
-        This method configures various attributes based on the input tensor properties
-        (data types, leading dimensions) and kernel settings:
-        - Configuring tiled MMA
-        - Computing MMA/cluster/tile shapes
-        - Computing cluster layout
-        - Computing multicast CTAs for A/B
-        - Computing epilogue subtile
-        - Setting up A/B/C stage counts in shared memory
-        - Computing A/B/C shared memory layout
-        - Computing tensor memory allocation columns
+        这个 method 根据 input tensor 属性
+        (data types、leading dimensions) 和 kernel settings 配置以下属性:
+        - 配置 tiled MMA
+        - 计算 MMA/cluster/tile shapes
+        - 计算 cluster layout
+        - 计算 A/B 的 multicast CTAs
+        - 计算 epilogue subtile
+        - 设置 A/B/C 在 SMEM 中的 stage 数量
+        - 计算 A/B/C 的 SMEM layout
+        - 计算 TMEM allocation columns
         """
-        # Configure tiled mma
+        # 配置 tiled MMA
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.a_dtype,
             self.a_major_mode,
@@ -327,7 +321,7 @@ class PersistentDenseGemmKernel:
             self.mma_tiler[:2],
         )
 
-        # Compute mma/cluster/tile shapes
+        # 计算 MMA、cluster 和 tile shapes
         mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])
         mma_inst_tile_k = 4
         self.mma_tiler = (
@@ -341,19 +335,19 @@ class PersistentDenseGemmKernel:
             self.mma_tiler[2],
         )
 
-        # Compute cluster layout
+        # 计算 cluster layout
         self.cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout((*self.cluster_shape_mn, 1)),
             (tiled_mma.thr_id.shape,),
         )
 
-        # Compute number of multicast CTAs for A/B
+        # 计算 A/B 的 multicast CTA 数量
         self.num_mcast_ctas_a = cute.size(self.cluster_layout_vmnk.shape[2])
         self.num_mcast_ctas_b = cute.size(self.cluster_layout_vmnk.shape[1])
         self.is_a_mcast = self.num_mcast_ctas_a > 1
         self.is_b_mcast = self.num_mcast_ctas_b > 1
 
-        # Compute epilogue subtile
+        # 计算 epilogue subtile
         if cutlass.const_expr(self.use_tma_store):
             self.epi_tile = sm100_utils.compute_epilogue_tile_shape(
                 self.cta_tile_shape_mnk,
@@ -364,7 +358,7 @@ class PersistentDenseGemmKernel:
         else:
             self.epi_tile = self.cta_tile_shape_mnk[:2]
 
-        # Setup A/B/C stage count in shared memory and ACC stage count in tensor memory
+        # 设置 A/B/C 在 SMEM 中的 stage 数量, 以及 ACC 在 TMEM 中的 stage 数量
         self.num_acc_stage, self.num_ab_stage, self.num_c_stage = self._compute_stages(
             tiled_mma,
             self.mma_tiler,
@@ -378,7 +372,7 @@ class PersistentDenseGemmKernel:
             self.use_tma_store,
         )
 
-        # Compute A/B/C shared memory layout
+        # 计算 A/B/C 的 SMEM layout
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
             tiled_mma,
             self.mma_tiler,
@@ -402,7 +396,7 @@ class PersistentDenseGemmKernel:
             else None
         )
 
-        # Compute the number of tensor memory allocation columns
+        # 计算 TMEM 分配的 columns 数量
         self.num_tmem_alloc_cols = self._compute_num_tmem_alloc_cols(
             tiled_mma, self.mma_tiler, self.num_acc_stage
         )
@@ -422,19 +416,19 @@ class PersistentDenseGemmKernel:
         barrier_flag_mc: cute.Tensor = None,
     ):
         """Execute the GEMM operation in steps:
-        - Setup static attributes before smem/grid/tma computation
-        - Setup TMA load/store atoms and tensors
-        - Compute grid size with regard to hardware constraints
-        - Define shared storage for kernel
-        - Launch the kernel synchronously
+        - 在计算 SMEM/grid/TMA 前设置静态属性
+        - 设置 TMA load/store atoms 和 tensors
+        - 根据 hardware constraints 计算 grid size
+        - 定义 kernel 的 shared storage
+        - 同步启动 kernel
 
-        :param a: Input tensor A
+        :param a: input tensor A
         :type a: cute.Tensor
-        :param b: Input tensor B
+        :param b: input tensor B
         :type b: cute.Tensor
-        :param c: Output tensor C
+        :param c: output tensor C
         :type c: cute.Tensor
-        :param c_mc: Output symmetric tensor C_mc, any write or read to a multicast tensor will be broadcasted to all GPUs
+        :param c_mc: symmetric output tensor C_mc; 对 multicast tensor 的读写会 broadcast 到所有 GPUs
         :type c_mc: cute.Tensor
         :param c_peer_tensors: List of peer tensors for all-reduce
         :type c_peer_tensors: List[cute.Tensor]
@@ -442,16 +436,16 @@ class PersistentDenseGemmKernel:
         :type barrier_flag: cute.Tensor
         :param barrier_flag_mc: Barrier flag for multicast tensor
         :type barrier_flag_mc: cute.Tensor
-        :param max_active_clusters: Maximum number of active clusters
+        :param max_active_clusters: active clusters 的最大数量
         :type max_active_clusters: cutlass.Constexpr
-        :param stream: CUDA stream for asynchronous execution
+        :param stream: 用于 asynchronous execution 的 CUDA stream
         :type stream: cuda.CUstream
         :param epilogue_op: Optional elementwise lambda function to apply to the output tensor
         :type epilogue_op: cutlass.Constexpr
         :raises TypeError: If input data types are incompatible with the MMA instruction.
         :raises AssertionError: If OOB (Out-Of-Bounds) tiles are present when TMA store is disabled.
         """
-        # Setup static attributes before smem/grid/tma computation
+        # 在计算 SMEM、grid 和 TMA 前设置静态属性
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
         self.b_dtype: Type[cutlass.Numeric] = b.element_type
         self.c_dtype: Type[cutlass.Numeric] = c.element_type
@@ -459,11 +453,11 @@ class PersistentDenseGemmKernel:
         self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
         self.c_layout = utils.LayoutEnum.from_tensor(c)
 
-        # Check if input data types are compatible with MMA instruction
+        # 检查 input data types 是否与 MMA instruction 兼容
         if cutlass.const_expr(self.a_dtype != self.b_dtype):
             raise TypeError(f"Type must match: {self.a_dtype} != {self.b_dtype}")
 
-        # Setup attributes that dependent on gemm inputs
+        # 设置依赖 GEMM inputs 的属性
         self._setup_attributes()
 
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
@@ -476,7 +470,7 @@ class PersistentDenseGemmKernel:
         )
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
 
-        # Setup TMA load for A
+        # 配置 A 的 TMA load
         a_op = sm100_utils.cluster_shape_to_tma_atom_A(
             self.cluster_shape_mn, tiled_mma.thr_id
         )
@@ -493,7 +487,7 @@ class PersistentDenseGemmKernel:
             ),
         )
 
-        # Setup TMA load for B
+        # 配置 B 的 TMA load
         b_op = sm100_utils.cluster_shape_to_tma_atom_B(
             self.cluster_shape_mn, tiled_mma.thr_id
         )
@@ -514,7 +508,7 @@ class PersistentDenseGemmKernel:
         b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
         self.num_tma_load_bytes = (a_copy_size + b_copy_size) * atom_thr_size
 
-        # Setup TMA store for C
+        # 配置 C 的 TMA store
         tma_atom_c = None
         tma_tensor_c = None
         if cutlass.const_expr(self.use_tma_store):
@@ -526,7 +520,7 @@ class PersistentDenseGemmKernel:
                 self.epi_tile,
             )
 
-        # Compute grid size
+        # 计算 grid size
         self.tile_sched_params, grid = self._compute_grid(
             c, self.cta_tile_shape_mnk, self.cluster_shape_mn, max_active_clusters
         )
@@ -537,7 +531,7 @@ class PersistentDenseGemmKernel:
             cute.cosize(self.c_smem_layout_staged.outer) if self.use_tma_store else 0
         )
 
-        # Define shared storage for kernel
+        # 定义 kernel 的 shared storage
         @cute.struct
         class SharedStorage:
             ab_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage]
@@ -571,7 +565,7 @@ class PersistentDenseGemmKernel:
 
         self.shared_storage = SharedStorage
 
-        # Launch the kernel synchronously
+        # 同步启动 kernel
         self.kernel(
             tiled_mma,
             tma_atom_a,
@@ -624,13 +618,13 @@ class PersistentDenseGemmKernel:
         barrier_flag_mc: cute.Tensor,
     ):
         """
-        GPU device kernel performing the Persistent batched GEMM computation.
+        执行 persistent batched GEMM 计算的 GPU device kernel.
         """
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
         #
-        # Prefetch tma desc
+        # 预取 TMA descriptors
         #
         if warp_idx == self.tma_warp_id:
             cpasync.prefetch_descriptor(tma_atom_a)
@@ -641,9 +635,9 @@ class PersistentDenseGemmKernel:
         use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
 
         #
-        # Setup cta/thread coordinates
+        # 设置 CTA/thread coordinates
         #
-        # Coords inside cluster
+        # cluster 内的 coordinates
         bidx, bidy, bidz = cute.arch.block_idx()
 
         mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
@@ -654,11 +648,11 @@ class PersistentDenseGemmKernel:
         block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(
             cta_rank_in_cluster
         )
-        # Coord inside cta
+        # CTA 内的 coordinate
         tidx, _, _ = cute.arch.thread_idx()
 
         #
-        # Alloc and init: a+b full/empty, accumulator full/empty, tensor memory dealloc barrier
+        # 分配并初始化: A+B full/empty、accumulator full/empty 和 TMEM dealloc barrier
         #
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
@@ -666,7 +660,7 @@ class PersistentDenseGemmKernel:
         tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar.ptr
         tmem_holding_buf = storage.tmem_holding_buf.ptr
 
-        # Initialize mainloop ab_pipeline (barrier) and states
+        # 初始化 mainloop ab_pipeline (barrier) 和 states
         ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         num_tma_producer = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
         ab_pipeline_consumer_group = pipeline.CooperativeGroup(
@@ -681,7 +675,7 @@ class PersistentDenseGemmKernel:
             cta_layout_vmnk=cluster_layout_vmnk,
         )
 
-        # Initialize acc_pipeline (barrier) and states
+        # 初始化 acc_pipeline (barrier) 和 states
         acc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         num_acc_consumer_threads = len(self.epilog_warp_id) * (
             2 if use_2cta_instrs else 1
@@ -697,7 +691,7 @@ class PersistentDenseGemmKernel:
             cta_layout_vmnk=cluster_layout_vmnk,
         )
 
-        # Tensor memory dealloc barrier init
+        # 初始化 TMEM dealloc barrier
         if use_2cta_instrs:
             if warp_idx == self.tma_warp_id:
                 num_tmem_dealloc_threads = 32
@@ -707,12 +701,12 @@ class PersistentDenseGemmKernel:
                     )
         cute.arch.mbarrier_init_fence()
 
-        # Cluster arrive after barrier init
+        # barrier 初始化后执行 cluster arrive
         if cute.size(self.cluster_shape_mn) > 1:
             cute.arch.cluster_arrive_relaxed()
 
         #
-        # Setup smem tensor A/B/C
+        # 设置 SMEM tensors A/B/C
         #
         # (EPI_TILE_M, EPI_TILE_N, STAGE)
         sC = (
@@ -732,7 +726,7 @@ class PersistentDenseGemmKernel:
         )
 
         #
-        # Compute multicast mask for A/B buffer full
+        # 计算 A/B buffer full 的 multicast mask
         #
         a_full_mcast_mask = None
         b_full_mcast_mask = None
@@ -745,7 +739,7 @@ class PersistentDenseGemmKernel:
             )
 
         #
-        # Local_tile partition global tensors
+        # 使用 local_tile 划分 global tensors
         #
         # (bM, bK, RestM, RestK, RestL)
         gA_mkl = cute.local_tile(
@@ -762,7 +756,7 @@ class PersistentDenseGemmKernel:
         k_tile_cnt = cute.size(gA_mkl, mode=[3])
 
         #
-        # Partition global tensor for TiledMMA_A/B/C
+        # 为 TiledMMA_A/B/C 划分 global tensor
         #
         thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
         # (MMA, MMA_M, MMA_K, RestM, RestK, RestL)
@@ -773,9 +767,9 @@ class PersistentDenseGemmKernel:
         tCgC = thr_mma.partition_C(gC_mnl)
 
         #
-        # Partition global/shared tensor for TMA load A/B
+        # 为 TMA load A/B 划分 global/shared tensor
         #
-        # TMA load A partition_S/D
+        # TMA load A 的 partition_S/D
         a_cta_layout = cute.make_layout(
             cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
         )
@@ -788,7 +782,7 @@ class PersistentDenseGemmKernel:
             cute.group_modes(sA, 0, 3),
             cute.group_modes(tCgA, 0, 3),
         )
-        # TMA load B partition_S/D
+        # TMA load B 的 partition_S/D
         b_cta_layout = cute.make_layout(
             cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
         )
@@ -803,7 +797,7 @@ class PersistentDenseGemmKernel:
         )
 
         #
-        # Partition shared/tensor memory tensor for TiledMMA_A/B/C
+        # 为 TiledMMA_A/B/C 划分 SMEM/TMEM tensor
         #
         # (MMA, MMA_M, MMA_K, STAGE)
         tCrA = tiled_mma.make_fragment_A(sA)
@@ -817,7 +811,7 @@ class PersistentDenseGemmKernel:
         )
 
         #
-        # Cluster wait before tensor memory alloc
+        # 分配 TMEM 前执行 cluster wait
         #
         if cute.size(self.cluster_shape_mn) > 1:
             cute.arch.cluster_wait()
@@ -832,7 +826,7 @@ class PersistentDenseGemmKernel:
 
         if warp_idx == self.tma_warp_id:
             #
-            # Persistent tile scheduling loop
+            # Persistent tile scheduling 循环
             #
             tile_sched = utils.StaticPersistentTileScheduler.create(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
@@ -844,7 +838,7 @@ class PersistentDenseGemmKernel:
             )
 
             while work_tile.is_valid_tile:
-                # Get tile coord from tile scheduler
+                # 从 tile scheduler 获取 tile coordinate
                 cur_tile_coord = work_tile.tile_idx
                 mma_tile_coord_mnl = (
                     cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
@@ -853,7 +847,7 @@ class PersistentDenseGemmKernel:
                 )
 
                 #
-                # Slice to per mma tile index
+                # 按 MMA tile index 切片
                 #
                 # ((atom_v, rest_v), RestK)
                 tAgA_slice = tAgA[
@@ -864,7 +858,7 @@ class PersistentDenseGemmKernel:
                     (None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])
                 ]
 
-                # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt
+                # 通过 try_wait 检查 k_tile=prefetch_k_tile_cnt 的 AB buffer empty
                 ab_producer_state.reset_count()
                 peek_ab_empty_status = cutlass.Boolean(1)
                 if ab_producer_state.count < k_tile_cnt:
@@ -872,15 +866,15 @@ class PersistentDenseGemmKernel:
                         ab_producer_state
                     )
                 #
-                # Tma load loop
+                # TMA load 循环
                 #
                 for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                    # Conditionally wait for AB buffer empty
+                    # 按条件等待 AB buffer empty
                     ab_pipeline.producer_acquire(
                         ab_producer_state, peek_ab_empty_status
                     )
 
-                    # TMA load A/B
+                    # 执行 A/B 的 TMA load
                     cute.copy(
                         tma_atom_a,
                         tAgA_slice[(None, ab_producer_state.count)],
@@ -896,7 +890,7 @@ class PersistentDenseGemmKernel:
                         mcast_mask=b_full_mcast_mask,
                     )
 
-                    # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt + k_tile + 1
+                    # 通过 try_wait 检查下一个预取 k_tile 的 AB buffer empty
                     ab_producer_state.advance()
                     peek_ab_empty_status = cutlass.Boolean(1)
                     if ab_producer_state.count < k_tile_cnt:
@@ -905,13 +899,13 @@ class PersistentDenseGemmKernel:
                         )
 
                 #
-                # Advance to next tile
+                # 推进到下一个 tile
                 #
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
             #
-            # Wait A/B buffer empty
+            # 等待 A/B buffer empty
             #
             ab_pipeline.producer_tail(ab_producer_state)
 
@@ -920,7 +914,7 @@ class PersistentDenseGemmKernel:
         #
         if warp_idx == self.mma_warp_id:
             #
-            # Bar sync for retrieve tensor memory ptr from shared mem
+            # 获取 SMEM 中的 TMEM pointer 前执行 barrier sync
             #
             tmem_ptr_read_threads = 32 * len((self.mma_warp_id, *self.epilog_warp_id))
             cute.arch.barrier(
@@ -929,7 +923,7 @@ class PersistentDenseGemmKernel:
             )
 
             #
-            # Retrieving tensor memory ptr and make accumulator tensor
+            # 获取 TMEM pointer 并创建 accumulator tensor
             #
             tmem_ptr = cute.arch.retrieve_tmem_ptr(
                 self.acc_dtype,
@@ -940,7 +934,7 @@ class PersistentDenseGemmKernel:
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
 
             #
-            # Persistent tile scheduling loop
+            # Persistent tile scheduling 循环
             #
             tile_sched = utils.StaticPersistentTileScheduler.create(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
@@ -955,7 +949,7 @@ class PersistentDenseGemmKernel:
             )
 
             while work_tile.is_valid_tile:
-                # Get tile coord from tile scheduler
+                # 从 tile scheduler 获取 tile coordinate
                 cur_tile_coord = work_tile.tile_idx
                 mma_tile_coord_mnl = (
                     cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
@@ -963,11 +957,11 @@ class PersistentDenseGemmKernel:
                     cur_tile_coord[2],
                 )
 
-                # Set tensor memory buffer for current tile
+                # 设置当前 tile 的 TMEM buffer
                 # (MMA, MMA_M, MMA_N)
                 tCtAcc = tCtAcc_base[(None, None, None, acc_producer_state.index)]
 
-                # Peek (try_wait) AB buffer full for k_tile = 0
+                # 通过 try_wait 检查 k_tile=0 的 AB buffer full
                 ab_consumer_state.reset_count()
                 peek_ab_full_status = cutlass.Boolean(1)
                 if ab_consumer_state.count < k_tile_cnt and is_leader_cta:
@@ -976,22 +970,22 @@ class PersistentDenseGemmKernel:
                     )
 
                 #
-                # Wait for accumulator buffer empty
+                # 等待 accumulator buffer empty
                 #
                 if is_leader_cta:
                     acc_pipeline.producer_acquire(acc_producer_state)
 
                 #
-                # Reset the ACCUMULATE field for each tile
+                # 为每个 tile 重置 ACCUMULATE field
                 #
                 tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
 
                 #
-                # Mma mainloop
+                # MMA mainloop
                 #
                 for k_tile in range(k_tile_cnt):
                     if is_leader_cta:
-                        # Conditionally wait for AB buffer full
+                        # 按条件等待 AB buffer full
                         ab_pipeline.consumer_wait(
                             ab_consumer_state, peek_ab_full_status
                         )
@@ -1013,13 +1007,13 @@ class PersistentDenseGemmKernel:
                                 tCrB[kblock_coord],
                                 tCtAcc,
                             )
-                            # Enable accumulate on tCtAcc after first kblock
+                            # 从第一个 kblock 之后启用 tCtAcc accumulate
                             tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
-                        # Async arrive AB buffer empty
+                        # 异步通知 AB buffer empty
                         ab_pipeline.consumer_release(ab_consumer_state)
 
-                    # Peek (try_wait) AB buffer full for k_tile = k_tile + 1
+                    # 通过 try_wait 检查下一个 k_tile 的 AB buffer full
                     ab_consumer_state.advance()
                     peek_ab_full_status = cutlass.Boolean(1)
                     if ab_consumer_state.count < k_tile_cnt:
@@ -1029,20 +1023,20 @@ class PersistentDenseGemmKernel:
                             )
 
                 #
-                # Async arrive accumulator buffer full
+                # 异步通知 accumulator buffer full
                 #
                 if is_leader_cta:
                     acc_pipeline.producer_commit(acc_producer_state)
                 acc_producer_state.advance()
 
                 #
-                # Advance to next tile
+                # 推进到下一个 tile
                 #
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
             #
-            # Wait for accumulator buffer empty
+            # 等待 accumulator buffer empty
             #
             acc_pipeline.producer_tail(acc_producer_state)
         #
@@ -1050,7 +1044,7 @@ class PersistentDenseGemmKernel:
         #
         if warp_idx < self.mma_warp_id:
             #
-            # Alloc tensor memory buffer
+            # 分配 TMEM buffer
             #
             if warp_idx == self.epilog_warp_id[0]:
                 cute.arch.alloc_tmem(
@@ -1060,7 +1054,7 @@ class PersistentDenseGemmKernel:
                 )
 
             #
-            # Bar sync for retrieve tensor memory ptr from shared memory
+            # 获取 SMEM 中的 TMEM pointer 前执行 barrier sync
             #
             tmem_ptr_read_threads = 32 * len((self.mma_warp_id, *self.epilog_warp_id))
             cute.arch.barrier(
@@ -1069,7 +1063,7 @@ class PersistentDenseGemmKernel:
             )
 
             #
-            # Retrieving tensor memory ptr and make accumulator tensor
+            # 获取 TMEM pointer 并创建 accumulator tensor
             #
             tmem_ptr = cute.arch.retrieve_tmem_ptr(
                 self.acc_dtype,
@@ -1080,7 +1074,7 @@ class PersistentDenseGemmKernel:
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
 
             #
-            # Partition for epilogue
+            # 为 epilogue 执行 partition
             #
             epi_tidx = tidx
             (
@@ -1121,7 +1115,7 @@ class PersistentDenseGemmKernel:
                 )
 
             #
-            # Persistent tile scheduling loop
+            # Persistent tile scheduling 循环
             #
             tile_sched = utils.StaticPersistentTileScheduler.create(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
@@ -1134,7 +1128,7 @@ class PersistentDenseGemmKernel:
 
             c_pipeline = None
             if cutlass.const_expr(self.use_tma_store):
-                # Threads/warps participating in tma store pipeline
+                # 参与 TMA store pipeline 的 threads/warps
                 c_producer_group = pipeline.CooperativeGroup(
                     pipeline.Agent.Thread,
                     32 * len(self.epilog_warp_id)
@@ -1145,7 +1139,7 @@ class PersistentDenseGemmKernel:
                 )
 
             while work_tile.is_valid_tile:
-                # Get tile coord from tile scheduler
+                # 从 tile scheduler 获取 tile coordinate
                 cur_tile_coord = work_tile.tile_idx
                 mma_tile_coord_mnl = (
                     cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
@@ -1154,7 +1148,7 @@ class PersistentDenseGemmKernel:
                 )
 
                 #
-                # Slice to per mma tile index
+                # 按 MMA tile index 切片
                 #
                 bSG_gC = None
                 tTR_gC = None
@@ -1181,14 +1175,14 @@ class PersistentDenseGemmKernel:
                         )
                     ]
 
-                # Set tensor memory buffer for current tile
+                # 设置当前 tile 的 TMEM buffer
                 # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
                 tTR_tAcc = tTR_tAcc_base[
                     (None, None, None, None, None, acc_consumer_state.index)
                 ]
 
                 #
-                # Wait for accumulator buffer full
+                # 等待 accumulator buffer full
                 #
                 acc_pipeline.consumer_wait(acc_consumer_state)
 
@@ -1199,26 +1193,26 @@ class PersistentDenseGemmKernel:
                     tTR_gC = cute.group_modes(tTR_gC, 3, cute.rank(tTR_gC))
 
                 #
-                # Store accumulator to global memory in subtiles
+                # 按 subtiles 将 accumulator 写入 global memory
                 #
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
                 num_prev_subtiles = tile_sched.num_tiles_executed * subtile_cnt
                 for subtile_idx in cutlass.range(subtile_cnt):
                     #
-                    # Load accumulator from tensor memory buffer to register
+                    # 将 accumulator 从 TMEM buffer 加载到 registers
                     #
                     tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
                     cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
 
                     if cutlass.const_expr(self.use_tma_store):
                         #
-                        # Convert to C type
+                        # 转换为 C type
                         #
                         acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
                         acc_vec = epilogue_op(acc_vec.to(self.c_dtype))
                         tRS_rC.store(acc_vec)
                         #
-                        # Store C to shared memory
+                        # 将 C 写入 SMEM
                         #
                         c_buffer = (num_prev_subtiles + subtile_idx) % self.num_c_stage
                         cute.copy(
@@ -1226,7 +1220,7 @@ class PersistentDenseGemmKernel:
                             tRS_rC,
                             tRS_sC[(None, None, None, c_buffer)],
                         )
-                        # Fence and barrier to make sure shared memory store is visible to TMA store
+                        # 使用 fence 和 barrier, 确保 SMEM store 对 TMA store 可见
                         cute.arch.fence_proxy("async.shared", space="cta")
                         epilog_threads = 32 * len(self.epilog_warp_id)
                         cute.arch.barrier(
@@ -1235,7 +1229,7 @@ class PersistentDenseGemmKernel:
                         )
 
                         #
-                        # TMA store C to global memory
+                        # 通过 TMA 将 C 写入 global memory
                         #
                         if warp_idx == self.epilog_warp_id[0]:
                             cute.copy(
@@ -1243,7 +1237,7 @@ class PersistentDenseGemmKernel:
                                 bSG_sC[(None, c_buffer)],
                                 bSG_gC[(None, subtile_idx)],
                             )
-                            # Fence and barrier to make sure shared memory store is visible to TMA store
+                            # 使用 fence 和 barrier, 确保 SMEM store 对 TMA store 可见
                             c_pipeline.producer_commit()
                             c_pipeline.producer_acquire()
                         cute.arch.barrier(
@@ -1252,27 +1246,27 @@ class PersistentDenseGemmKernel:
                         )
                     else:
                         #
-                        # Convert to C type
+                        # 转换为 C type
                         #
                         acc_vec = tTR_rAcc.load()
                         acc_vec = epilogue_op(acc_vec.to(self.c_dtype))
                         tTR_rC.store(acc_vec)
 
                         #
-                        # Store C to global memory
+                        # 将 C 写入 global memory
                         #
                         cute.copy(
                             simt_atom, tTR_rC, tTR_gC[(None, None, None, subtile_idx)]
                         )
 
                 #
-                # Async arrive accumulator buffer empty
+                # 异步通知 accumulator buffer empty
                 #
                 with cute.arch.elect_one():
                     acc_pipeline.consumer_release(acc_consumer_state)
                 acc_consumer_state.advance()
 
-                # Reduce Scatter
+                # Reduce-Scatter
                 if cutlass.const_expr(self.reduce_scatter == "two_shot"):
                     tile_id = Int32(
                         tile_sched._current_work_linear_idx
@@ -1280,7 +1274,7 @@ class PersistentDenseGemmKernel:
                     )
                     if warp_idx == self.epilog_warp_id[0]:
                         cute.arch.cp_async_bulk_wait_group(0, read=False)
-                        # System barrier to make sure that data from each GPU is in memory before reduce scatter
+                        # 使用 system barrier, 确保执行 reduce-scatter 前各 GPU 的数据已写入 memory
                         with cute.arch.elect_one():
                             flag = barrier_flag_mc.iterator + tile_id
                             utils.distributed.multimem_red_add1(
@@ -1290,13 +1284,13 @@ class PersistentDenseGemmKernel:
                             )
 
                 #
-                # Advance to next tile
+                # 推进到下一个 tile
                 #
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
             #
-            # Dealloc the tensor memory buffer
+            # 释放 TMEM buffer
             #
             if warp_idx == self.epilog_warp_id[0]:
                 cute.arch.relinquish_tmem_alloc_permit(is_two_cta=use_2cta_instrs)
@@ -1314,18 +1308,18 @@ class PersistentDenseGemmKernel:
                     tmem_ptr, self.num_tmem_alloc_cols, is_two_cta=use_2cta_instrs
                 )
             #
-            # Wait for C store complete
+            # 等待 C store 完成
             #
             if cutlass.const_expr(self.use_tma_store):
                 c_pipeline.producer_tail()
 
         # ///////////////////////////////////////////////////////////////////////////////
-        #  Reduce Scatter warps
+        # Reduce-Scatter warps
         # ///////////////////////////////////////////////////////////////////////////////
         if cutlass.const_expr(self.reduce_scatter == "two_shot"):
             if warp_idx >= self.reduce_scatter_warp_id[0]:
                 # ///////////////////////////////////////////////////////////////////////////////
-                # Add persistent tile loop
+                # 添加 persistent tile 循环
                 # ///////////////////////////////////////////////////////////////////////////////
 
                 rank_id = self.rank_id
@@ -1337,7 +1331,7 @@ class PersistentDenseGemmKernel:
                 )
                 work_tile = tile_sched.initial_work_tile_info()
 
-                # we want 128bit ld/st for better performance
+                # 使用 128-bit load/store 以获得更好性能
                 atom_val = 128 // c_mc.element_type.width
                 atom_thr_n = self.mma_tiler[1] // atom_val
                 atom_thr_m = len(self.reduce_scatter_warp_id) * cute.arch.WARP_SIZE // atom_thr_n
@@ -1351,7 +1345,7 @@ class PersistentDenseGemmKernel:
                 # predicate tensor
                 idC = cute.make_identity_tensor(c_mc.shape)
                 
-                # partition and slice at tile level
+                # 在 tile 级别执行 partition 和 slice
                 gC_mc = cute.local_tile(
                     c_mc, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
                 )
@@ -1379,7 +1373,7 @@ class PersistentDenseGemmKernel:
                     if not is_leader_cta:
                         tile_id = tile_id + 1
 
-                    # System barrier to make sure that data from each GPU is in memory before Reduce Scatter
+                    # 使用 system barrier, 确保执行 Reduce-Scatter 前各 GPU 的数据已写入 memory
                     flag = barrier_flag.iterator + tile_id
                     
                     if warp_idx == self.reduce_scatter_warp_id[0]:
@@ -1473,7 +1467,7 @@ class PersistentDenseGemmKernel:
                                     asm_dialect=0
                                 )
 
-                    # Advance to next tile
+                    # 推进到下一个 tile
                     tile_sched.advance_to_next_work()
                     work_tile = tile_sched.get_current_work()
 
@@ -1481,17 +1475,17 @@ class PersistentDenseGemmKernel:
                     barrier_id=self.reduce_scatter_sync_bar_id,
                     number_of_threads=32 * len(self.reduce_scatter_warp_id),
                 )
-                # System barrier to make sure all the peer memory transfers are completed.
+                # 使用 system barrier, 确保所有 peer memory transfers 均已完成.
                 last_flag_idx = cute.size(
                     tile_sched.params.problem_layout_ncluster_mnl
                 ) * cute.size(self.cluster_shape_mn)
                 if warp_idx == self.reduce_scatter_warp_id[0]:
                     with cute.arch.elect_one():
-                        # Offset to last tile flag idx
+                        # 最后一个 tile flag 的 offset
                         last_tile_id_linear = cute.size(
                             tile_sched.params.problem_layout_ncluster_mnl
                         ) * cute.size(self.cluster_shape_mn)
-                        # Linear id of current SM.
+                        # 当前 SM 的 linear id.
                         sm_id_linear = (
                             cute.arch.block_idx()[0]
                             + cute.arch.block_idx()[1] * cute.arch.grid_dim()[0]
@@ -1499,7 +1493,7 @@ class PersistentDenseGemmKernel:
                             * cute.arch.grid_dim()[0]
                             * cute.arch.grid_dim()[1]
                         )
-                        # Release flag with sys scope
+                        # 以 sys scope 执行 release flag
                         utils.distributed.multimem_red_add1(
                             lock_ptr=barrier_flag_mc.iterator
                             + last_tile_id_linear
@@ -1507,7 +1501,7 @@ class PersistentDenseGemmKernel:
                             scope="sys",
                             order="release",
                         )
-                        # Relaxed spin-lock wait flag with sys scope
+                        # 以 sys scope 使用 relaxed spin-lock 等待 flag
                         utils.distributed.spin_lock_atom_cas_relaxed_wait(
                             lock_ptr=barrier_flag.iterator
                             + last_tile_id_linear
@@ -1527,17 +1521,17 @@ class PersistentDenseGemmKernel:
         use_2cta_instrs: Union[cutlass.Boolean, bool],
     ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
         """
-        Make tiledCopy for tensor memory load, then use it to partition tensor memory (source) and register array (destination).
+        为 TMEM load 创建 tiledCopy, 再用它划分 TMEM source 和 register array destination.
 
-        :param tidx: The thread index in epilogue warp groups
+        :param tidx: epilogue warp groups 中的 thread index
         :type tidx: cutlass.Int32
-        :param tAcc: The accumulator tensor to be copied and partitioned
+        :param tAcc: 待 copy 和 partition 的 accumulator tensor
         :type tAcc: cute.Tensor
-        :param gC_mnl: The global tensor C
+        :param gC_mnl: global tensor C
         :type gC_mnl: cute.Tensor
-        :param epi_tile: The epilogue tiler
+        :param epi_tile: epilogue tiler
         :type epi_tile: cute.Tile
-        :param use_2cta_instrs: Whether use_2cta_instrs is enabled
+        :param use_2cta_instrs: 是否启用 use_2cta_instrs
         :type use_2cta_instrs: bool
 
         :return: A tuple containing (tiled_copy_t2r, tTR_tAcc, tTR_rAcc) where:
@@ -1546,7 +1540,7 @@ class PersistentDenseGemmKernel:
             - tTR_rAcc: The accumulated tensor in register used to hold t2r results
         :rtype: Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]
         """
-        # Make tiledCopy for tensor memory load
+        # 为 TMEM load 创建 tiledCopy
         copy_atom_t2r = sm100_utils.get_tmem_load_op(
             self.cta_tile_shape_mnk,
             self.c_layout,
@@ -1589,15 +1583,15 @@ class PersistentDenseGemmKernel:
         sC: cute.Tensor,
     ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
         """
-        Make tiledCopy for shared memory store, then use it to partition register array (source) and shared memory (destination).
+        为 SMEM store 创建 tiledCopy, 再用它划分 register array source 和 SMEM destination.
 
-        :param tiled_copy_t2r: The tiled copy operation for tmem to register copy(t2r)
+        :param tiled_copy_t2r: 用于 TMEM 到 register copy (T2R) 的 tiled copy operation
         :type tiled_copy_t2r: cute.TiledCopy
-        :param tTR_rC: The partitioned accumulator tensor
+        :param tTR_rC: partition 后的 accumulator tensor
         :type tTR_rC: cute.Tensor
-        :param tidx: The thread index in epilogue warp groups
+        :param tidx: epilogue warp groups 中的 thread index
         :type tidx: cutlass.Int32
-        :param sC: The shared memory tensor to be copied and partitioned
+        :param sC: 待 copy 和 partition 的 SMEM tensor
         :type sC: cute.Tensor
         :type sepi: cute.Tensor
 
@@ -1630,15 +1624,15 @@ class PersistentDenseGemmKernel:
         - partition register array (source) and global memory (destination) for none TMA store version;
         - partition shared memory (source) and global memory (destination) for TMA store version.
 
-        :param tidx: The thread index in epilogue warp groups
+        :param tidx: epilogue warp groups 中的 thread index
         :type tidx: cutlass.Int32
-        :param atom: The copy_atom_c to be used for TMA store version, or tiled_copy_t2r for none TMA store version
+        :param atom: TMA store 版本使用 copy_atom_c, 非 TMA store 版本使用 tiled_copy_t2r
         :type atom: cute.CopyAtom or cute.TiledCopy
-        :param gC_mnl: The global tensor C
+        :param gC_mnl: global tensor C
         :type gC_mnl: cute.Tensor
-        :param epi_tile: The epilogue tiler
+        :param epi_tile: epilogue tiler
         :type epi_tile: cute.Tile
-        :param sC: The shared memory tensor to be copied and partitioned
+        :param sC: 待 copy 和 partition 的 SMEM tensor
         :type sC: cute.Tensor
 
         :return: A tuple containing either:
@@ -1697,38 +1691,38 @@ class PersistentDenseGemmKernel:
     ) -> Tuple[int, int, int]:
         """Computes the number of stages for A/B/C operands based on heuristics.
 
-        :param tiled_mma: The tiled MMA object defining the core computation.
+        :param tiled_mma: 定义主要计算的 tiled MMA object.
         :type tiled_mma: cute.TiledMma
-        :param mma_tiler_mnk: The shape (M, N, K) of the MMA tiler.
+        :param mma_tiler_mnk: MMA tiler 的 shape (M, N, K).
         :type mma_tiler_mnk: tuple[int, int, int]
-        :param a_dtype: Data type of operand A.
+        :param a_dtype: operand A 的 data type.
         :type a_dtype: type[cutlass.Numeric]
-        :param b_dtype: Data type of operand B.
+        :param b_dtype: operand B 的 data type.
         :type b_dtype: type[cutlass.Numeric]
-        :param epi_tile: The epilogue tile shape.
+        :param epi_tile: epilogue tile shape.
         :type epi_tile: cute.Tile
-        :param c_dtype: Data type of operand C (output).
+        :param c_dtype: operand C (output) 的 data type.
         :type c_dtype: type[cutlass.Numeric]
-        :param c_layout: Layout enum of operand C.
+        :param c_layout: operand C 的 Layout enum.
         :type c_layout: utils.LayoutEnum
-        :param smem_capacity: Total available shared memory capacity in bytes.
+        :param smem_capacity: 可用 shared memory 总容量, 单位为 bytes.
         :type smem_capacity: int
-        :param occupancy: Target number of CTAs per SM (occupancy).
+        :param occupancy: 每个 SM 的目标 CTA 数量 (occupancy).
         :type occupancy: int
-        :param use_tma_store: Whether TMA store is enabled.
+        :param use_tma_store: 是否启用 TMA store.
         :type use_tma_store: bool
 
         :return: A tuple containing the computed number of stages for:
                  (ACC stages, A/B operand stages, C stages)
         :rtype: tuple[int, int, int]
         """
-        # Default ACC stages
+        # 默认 ACC stages
         num_acc_stage = 2
 
-        # Default C stages
+        # 默认 C stages
         num_c_stage = 2 if use_tma_store else 0
 
-        # Calculate smem layout and size for one stage of A, B, and C
+        # 计算 A、B、C 单个 stage 的 SMEM layout 和大小
         a_smem_layout_stage_one = sm100_utils.make_smem_layout_a(
             tiled_mma,
             mma_tiler_mnk,
@@ -1762,17 +1756,17 @@ class PersistentDenseGemmKernel:
         )
         c_bytes = c_bytes_per_stage * num_c_stage
 
-        # Calculate A/B stages:
-        # Start with total smem per CTA (capacity / occupancy)
-        # Subtract reserved bytes and initial C stages bytes
-        # Divide remaining by bytes needed per A/B stage
+        # 计算 A/B stages:
+        # 从每个 CTA 可用的 SMEM 总量开始计算, 即 capacity / occupancy
+        # 减去 reserved bytes 和初始 C stages bytes
+        # 再除以每个 A/B stage 所需的 bytes
         num_ab_stage = (
             smem_capacity // occupancy - (mbar_helpers_bytes + c_bytes)
         ) // ab_bytes_per_stage
 
-        # Refine epilogue stages:
-        # Calculate remaining smem after allocating for A/B stages and reserved bytes
-        # Add remaining unused smem to epilogue
+        # 调整 epilogue stages:
+        # 计算分配 A/B stages 和 reserved bytes 后剩余的 SMEM
+        # 把剩余未使用的 SMEM 分配给 epilogue
         if use_tma_store:
             num_c_stage += (
                 smem_capacity
@@ -1790,13 +1784,13 @@ class PersistentDenseGemmKernel:
     ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
         """Use persistent tile scheduler to compute the grid size for the output tensor C.
 
-        :param c: The output tensor C
+        :param c: output tensor C
         :type c: cute.Tensor
-        :param cta_tile_shape_mnk: The shape (M, N, K) of the CTA tile.
+        :param cta_tile_shape_mnk: CTA tile 的 shape (M,N,K).
         :type cta_tile_shape_mnk: tuple[int, int, int]
-        :param cluster_shape_mn: Shape of each cluster in M, N dimensions.
+        :param cluster_shape_mn: 每个 cluster 在 M、N dimensions 上的 shape.
         :type cluster_shape_mn: tuple[int, int]
-        :param max_active_clusters: Maximum number of active clusters.
+        :param max_active_clusters: active clusters 的最大数量.
         :type max_active_clusters: cutlass.Constexpr
 
         :return: A tuple containing:
@@ -1825,16 +1819,16 @@ class PersistentDenseGemmKernel:
         num_acc_stage: int,
     ) -> int:
         """
-        Compute the number of tensor memory allocation columns.
+        计算 TMEM allocation columns 数量.
 
-        :param tiled_mma: The tiled MMA object defining the core computation.
+        :param tiled_mma: 定义主要计算的 tiled MMA object.
         :type tiled_mma: cute.TiledMma
-        :param mma_tiler: The shape (M, N, K) of the MMA tile.
+        :param mma_tiler: MMA tile 的 shape (M,N,K).
         :type mma_tiler: tuple[int, int, int]
-        :param num_acc_stage: The stage of the accumulator tensor.
+        :param num_acc_stage: accumulator tensor 的 stage 数量.
         :type num_acc_stage: int
 
-        :return: The number of tensor memory allocation columns.
+        :return: TMEM allocation columns 数量.
         :rtype: int
         """
         acc_shape = tiled_mma.partition_shape_C(mma_tiler[:2])
@@ -1849,13 +1843,13 @@ class PersistentDenseGemmKernel:
         c_dtype: Type[cutlass.Numeric],
     ) -> bool:
         """
-        Check if the dtypes are valid
+        检查 dtypes 是否有效.
 
-        :param ab_dtype: The data type of the A and B operands
+        :param ab_dtype: A 和 B operands 的 data type
         :type ab_dtype: Type[cutlass.Numeric]
-        :param acc_dtype: The data type of the accumulator
+        :param acc_dtype: accumulator 的 data type
         :type acc_dtype: Type[cutlass.Numeric]
-        :param c_dtype: The data type of the output tensor
+        :param c_dtype: output tensor 的 data type
         :type c_dtype: Type[cutlass.Numeric]
 
         :return: True if the dtypes are valid, False otherwise
@@ -1876,7 +1870,7 @@ class PersistentDenseGemmKernel:
         if self.acc_dtype not in {cutlass.Float32, cutlass.Float16, cutlass.Int32}:
             return False
 
-        # Define compatibility mapping between accumulator type and AB type
+        # 定义 accumulator type 与 AB type 的兼容关系
         acc_ab_compatibility = {
             cutlass.Float32: {
                 cutlass.Float16,
@@ -1892,11 +1886,11 @@ class PersistentDenseGemmKernel:
             },
             cutlass.Int32: {cutlass.Uint8, cutlass.Int8},
         }
-        # Check compatibility between accumulator type and AB type
+        # 检查 accumulator type 与 AB type 是否兼容
         if ab_dtype not in acc_ab_compatibility[self.acc_dtype]:
             return False
 
-        # Define compatibility mapping between accumulator type and C type
+        # 定义 accumulator type 与 C type 的兼容关系
         acc_c_compatibility = {
             cutlass.Float32: {
                 cutlass.Float32,
@@ -1921,11 +1915,11 @@ class PersistentDenseGemmKernel:
                 cutlass.Uint8,
             },
         }
-        # Check compatibility between accumulator type and C type
+        # 检查 accumulator type 与 C type 是否兼容
         if c_dtype not in acc_c_compatibility[self.acc_dtype]:
             return False
 
-        # check if c_dtype is supported by multimem all-reduce
+        # 检查 multimem all-reduce 是否支持 c_dtype
         if cutlass.const_expr(c_dtype not in {cutlass.Float16, cutlass.Float32, cutlass.BFloat16, cutlass.Float8E4M3FN, cutlass.Float8E5M2}):
             return False
 
@@ -1934,11 +1928,11 @@ class PersistentDenseGemmKernel:
     def is_valid_mma_tiler_and_cluster_shape(self) -> bool:
         """Check if the mma tiler and cluster shape are valid.
 
-        :return: True if the mma tiler and cluster shape are valid, False otherwise
+        :return: MMA tiler 和 cluster shape 有效时返回 True, 否则返回 False
         :rtype: bool
         """
         is_valid = True
-        # Skip invalid mma tile shape
+        # 排除无效的 MMA tile shape
         if not (
             (not self.use_2cta_instrs and self.mma_tiler_mn[0] in [64, 128])
             or (self.use_2cta_instrs and self.mma_tiler_mn[0] in [128, 256])
@@ -1946,10 +1940,10 @@ class PersistentDenseGemmKernel:
             is_valid = False
         if self.mma_tiler_mn[1] not in range(32, 257, 32):
             is_valid = False
-        # Skip illegal cluster shape
+        # 排除不合法的 cluster shape
         if self.cluster_shape_mn[0] % (2 if self.use_2cta_instrs else 1) != 0:
             is_valid = False
-        # Skip invalid cluster shape
+        # 排除无效的 cluster shape
         is_power_of_2 = lambda x: x > 0 and (x & (x - 1)) == 0
         if (
             self.cluster_shape_mn[0] * self.cluster_shape_mn[1] > 16
@@ -1974,28 +1968,28 @@ class PersistentDenseGemmKernel:
         c_major: str,
     ) -> bool:
         """
-        Check if the tensor alignment is valid
+        检查 tensor alignment 是否有效.
 
-        :param m: The number of rows in the A tensor
+        :param m: A tensor 的 rows 数量
         :type m: int
-        :param n: The number of columns in the B tensor
+        :param n: B tensor 的 columns 数量
         :type n: int
-        :param k: The number of columns in the A tensor
+        :param k: A tensor 的 columns 数量
         :type k: int
-        :param l: The number of columns in the C tensor
+        :param l: C tensor 的 columns 数量
         :type l: int
-        :param ab_dtype: The data type of the A and B operands
+        :param ab_dtype: A 和 B operands 的 data type
         :type ab_dtype: Type[cutlass.Numeric]
-        :param c_dtype: The data type of the output tensor
+        :param c_dtype: output tensor 的 data type
         :type c_dtype: Type[cutlass.Numeric]
-        :param a_major: The major axis of the A tensor
+        :param a_major: A tensor 的 major axis
         :type a_major: str
-        :param b_major: The major axis of the B tensor
+        :param b_major: B tensor 的 major axis
         :type b_major: str
-        :param c_major: The major axis of the C tensor
+        :param c_major: C tensor 的 major axis
         :type c_major: str
 
-        :return: True if the problem shape is valid, False otherwise
+        :return: problem shape 有效时返回 True, 否则返回 False
         :rtype: bool
         """
         is_valid = True
@@ -2021,19 +2015,19 @@ class PersistentDenseGemmKernel:
         n: int,
     ) -> bool:
         """
-        Check if the epilogue store option is valid
+        检查 epilogue store option 是否有效.
 
-        :param m: The number of rows in the A tensor
+        :param m: A tensor 的 rows 数量
         :type m: int
-        :param n: The number of columns in the B tensor
+        :param n: B tensor 的 columns 数量
         :type n: int
 
-        :return: True if the epilogue store option is valid, False otherwise
+        :return: epilogue store option 有效时返回 True, 否则返回 False
         :rtype: bool
         """
 
         is_valid = True
-        # None TMA store version does not have predication, can not support OOB tiles
+        # 不使用 TMA store 的版本没有 predication, 因此不支持 OOB tiles
         cta_tile_shape_mn = (
             self.mma_tiler_mn[0] // (2 if self.use_2cta_instrs else 1),
             self.mma_tiler_mn[1],
@@ -2046,19 +2040,19 @@ class PersistentDenseGemmKernel:
     def can_implement(self, a: cute.Tensor, b: cute.Tensor, c: cute.Tensor) -> bool:
         """Check if the given tensors can be implemented by this kernel.
 
-        :param a: Input tensor A
+        :param a: input tensor A
         :type a: cute.Tensor
-        :param b: Input tensor B
+        :param b: input tensor B
         :type b: cute.Tensor
-        :param c: Output tensor C
+        :param c: output tensor C
         :type c: cute.Tensor
 
-        :return: True if the gemm supports the given config, False otherwise
+        :return: GEMM 支持给定配置时返回 True, 否则返回 False
         :rtype: bool
         """
         m, n, k, l = a.shape[0], b.shape[0], a.shape[1], a.shape[2]
 
-        # infer a_major, b_major, c_major
+        # 推导 a_major、b_major 和 c_major
         is_m_major_a = utils.LayoutEnum.from_tensor(a).is_m_major_a()
         is_n_major_b = utils.LayoutEnum.from_tensor(b).is_n_major_b()
         is_m_major_c = utils.LayoutEnum.from_tensor(c).is_m_major_c()
@@ -2067,24 +2061,24 @@ class PersistentDenseGemmKernel:
         c_major = "m" if is_m_major_c else "n"
 
         can_implement = True
-        # Skip unsupported types
+        # 排除不支持的 types
         if not self.is_valid_dtypes(a.element_type, c.element_type):
             can_implement = False
-        # Skip invalid mma tile shape and cluster shape
+        # 排除无效的 MMA tile shape 和 cluster shape
         if not self.is_valid_mma_tiler_and_cluster_shape():
             can_implement = False
-        # Skip illegal problem shape for load/store alignment
+        # 排除不满足 load/store alignment 的 problem shape
         if not self.is_valid_tensor_alignment(
             m, n, k, l, a.element_type, c.element_type, a_major, b_major, c_major
         ):
             can_implement = False
-        # Skip invalid epilogue store option
+        # 排除无效的 epilogue store option
         if not self.is_valid_epilog_store_option(m, n):
             can_implement = False
         if dist.get_world_size() not in [2, 4, 8]:
             can_implement = False
         if m % 128 != 0:
-            # cannot support OOB tiles when m is not divisible by 128
+            # m 不能被 128 整除时不支持 OOB tiles
             can_implement = False
 
         return can_implement
@@ -2159,10 +2153,10 @@ def create_tensors(
 def compare(
     a_torch_cpu, b_torch_cpu, c_torch_gpu, c_dtype, tolerance
 ):
-    # Copy gpu result back
+    # 取回 GPU 计算结果
     kernel_result = c_torch_gpu.cpu()
 
-    # Compute reference result
+    # 计算 reference result
     ref = torch.einsum(
         "mkl,nkl->mnl",
         a_torch_cpu.to(dtype=torch.float32),
@@ -2178,12 +2172,12 @@ def compare(
     torch_acc_dtype = cutlass_torch.dtype(acc_dtype)
     torch_c_dtype = cutlass_torch.dtype(c_dtype)
 
-    # note that in this example, f8 reduce sum is done by f16 acc precision and f16 by f32
+    # 本示例中, f8 reduce sum 使用 f16 accumulation precision, f16 则使用 f32
     ref = ref.to(torch_c_dtype).to(torch_acc_dtype).cuda()
     torch.distributed.all_reduce(ref, op=torch.distributed.ReduceOp.SUM)
     ref = ref.to(torch_c_dtype)
 
-    # convert to higher precision to satisfy assert_close function
+    # 转换为更高精度, 以满足 assert_close function 的要求
     ref_result = ref.cpu().to(torch_acc_dtype)
     kernel_result = c_torch_gpu.view(torch_c_dtype).cpu().to(torch_acc_dtype)
 
@@ -2197,7 +2191,7 @@ def compare(
     start_idx = rank_id * chunk_per_rank
     end_idx = start_idx + chunk_per_rank
 
-    # Assert close results
+    # 检查结果是否足够接近
     torch.testing.assert_close(kernel_result[start_idx:end_idx,:], ref_result[start_idx:end_idx,:], atol=tolerance, rtol=1e-05)
 
 
@@ -2228,13 +2222,13 @@ def run(
 
     :param mnkl: Problem size (M, N, K, L)
     :type mnkl: Tuple[int, int, int, int]
-    :param ab_dtype: Data type for input tensors A and B
+    :param ab_dtype: input tensors A 和 B 的 data type
     :type ab_dtype: Type[cutlass.Numeric]
-    :param c_dtype: Data type for output tensor C
+    :param c_dtype: output tensor C 的 data type
     :type c_dtype: Type[cutlass.Numeric]
-    :param acc_dtype: Data type for accumulation during matrix multiplication
+    :param acc_dtype: matrix multiplication 期间用于 accumulation 的 data type
     :type acc_dtype: Type[cutlass.Numeric]
-    :param a_major/b_major/c_major: Memory layout of tensor A/B/C
+    :param a_major/b_major/c_major: tensors A/B/C 的 memory layout
     :type a_major/b_major/c_major: str
     :param mma_tiler_mn: MMA tiling size. If not specified in the decorator parameters, the autotuner will use the
         default value of (256, 256). Otherwise, the autotuner will use the value specified in the decorator parameters.
@@ -2250,19 +2244,19 @@ def run(
     :type use_tma_store: bool, optional
     :param tolerance: Tolerance value for reference validation comparison, defaults to 1e-01
     :type tolerance: float, optional
-    :param warmup_iterations: Number of warmup iterations before benchmarking, defaults to 0
+    :param warmup_iterations: benchmark 前的 warmup iteration 数量, 默认为 0
     :type warmup_iterations: int, optional
-    :param iterations: Number of benchmark iterations to run, defaults to 1
+    :param iterations: benchmark iteration 数量, 默认为 1
     :type iterations: int, optional
-    :param skip_ref_check: Whether to skip reference result validation, defaults to False
+    :param skip_ref_check: 是否跳过 reference result 校验, 默认为 False
     :type skip_ref_check: bool, optional
-    :param use_cold_l2: Whether to use circular buffer strategy to ensure cold L2 cache, defaults to False
+    :param use_cold_l2: 是否使用 circular buffer 保证 cold L2 cache, 默认为 False
     :type use_cold_l2: bool, optional
     :param reduce_scatter: reduce scatter mode, can be "two_shot"
     :type reduce_scatter: str, optional
-    :raises RuntimeError: If CUDA GPU is not available
-    :raises ValueError: If the configuration is invalid or unsupported by the kernel
-    :return: Execution time of the GEMM kernel
+    :raises RuntimeError: CUDA GPU 不可用时抛出
+    :raises ValueError: 配置无效或 kernel 不支持时抛出
+    :return: GEMM kernel 的执行时间
     :rtype: float
     """
     print(f"Running Blackwell Persistent Dense GEMM test with:")
@@ -2279,15 +2273,15 @@ def run(
     print(f"Use cold L2: {'True' if use_cold_l2 else 'False'}")
     print(f"Fused Reduce Scatter Op: {reduce_scatter}")
 
-    # Unpack parameters
+    # 解包参数
     m, n, k, l = mnkl
 
     if not torch.cuda.is_available():
         raise RuntimeError("GPU is required to run this example!")
 
-    # Get current CUDA stream from PyTorch
+    # 从 PyTorch 获取当前 CUDA stream
     torch_stream = torch.cuda.current_stream()
-    # Get the raw stream pointer as a CUstream
+    # 获取 CUstream 类型的原始 stream pointer
     current_stream = cuda.CUstream(torch_stream.cuda_stream)
     (
         a_tensor,
@@ -2305,7 +2299,7 @@ def run(
         l, m, n, k, a_major, b_major, c_major, ab_dtype, c_dtype
     )
 
-    # Build GEMM object
+    # 创建 GEMM object
     gemm = PersistentDenseGemmKernel(
         acc_dtype,
         use_2cta_instrs,
@@ -2315,7 +2309,7 @@ def run(
         reduce_scatter=reduce_scatter,
     )
 
-    # Check if configuration can be implemented
+    # 检查当前配置能否实现
     can_implement = gemm.can_implement(a_tensor, b_tensor, c_tensor)
     if not can_implement:
         raise ValueError(
@@ -2457,29 +2451,29 @@ def run(
 
 def torchrun_uid_init_bcast():
     """
-    Initialize NVSHMEM using UniqueID with `torchrun` as the launcher
+    使用 UniqueID 初始化 NVSHMEM, 并以 `torchrun` 作为 launcher.
 
-    It uses torch.distributed.broadcast on a NumPy array to handle the broadcasting
+    这里通过 torch.distributed.broadcast 广播 NumPy array.
     """
-    # Set Torch device
+    # 设置 Torch device
     local_rank = int(os.environ['LOCAL_RANK'])
     torch.cuda.set_device(local_rank)
 
-    # nvshmem4py requires a cuda.core Device at init time
+    # nvshmem4py 初始化时需要 cuda.core Device
     dev = Device(local_rank)
     dev.set_current()
     global stream
     stream = dev.create_stream()
 
-    # Initialize torch.distributed process group
+    # 初始化 torch.distributed process group
     dist.init_process_group(
         backend="cpu:gloo,cuda:nccl",
     )
 
-    # Extract rank, nranks from process group
+    # 从 process group 取 rank 和 nranks
     num_ranks = dist.get_world_size()
 
-    # Create an empty uniqueid for all ranks
+    # 为所有 ranks 创建空 uniqueid
     uid = nvshmem.core.get_unique_id(empty=(local_rank != 0))
     uid_bytes = uid._data.view(np.uint8).copy()
     uid_tensor = torch.from_numpy(uid_bytes).cuda()

@@ -1,6 +1,6 @@
 # FlashAttention 2 代码分析：Triton 实现
 
-之前工作中对比了 FlashAttention 的 Triton/CuTile/FA3/Gluon/FA4 的性能，本文主要梳理 FlashAttention 2 在 Triton 官方教程中的实现，主要代码源自 Triton 官方教程 (OpenAI kernel team)，完整代码见 [06-fused-attention.py](https://github.com/slowlyC/ai-infra-notes/blob/main/tutorials/triton/06-fused-attention.py)
+之前工作中对比了 FlashAttention 的 Triton/CuTile/FA3-CUTLASS/Gluon/FA4-CuTeDSL 的性能，本文主要梳理下 FlashAttention 2 在 Triton 官方教程中的实现，完整代码见 [06-fused-attention.py](https://github.com/slowlyC/ai-infra-notes/blob/main/tutorials/triton/06-fused-attention.py)
 
 > 论文：Tri Dao, *FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning*, 2023.
 >
@@ -18,7 +18,7 @@ P = softmax(S)       ← 需要两次遍历 (max + sum)
 O = P × V            ← O(N²d) 计算
 ```
 
-当序列长度 N 较大时，S 和 P 占用的 HBM 成为瓶颈。FlashAttention 的思路是分块（tiling）计算——只在 SRAM 中保留当前 block 的中间结果，不把 N \times N 矩阵写回 HBM。
+当序列长度 N 较大时，S 和 P 占用的 HBM 成为瓶颈。FlashAttention 的思路是分块（tiling）计算——只在 SRAM 中保留当前 block 的中间结果，不把 $N \times N$ 矩阵写回 HBM。
 
 ### 1.2 Forward 原理
 
@@ -68,7 +68,7 @@ dQ = dS × K                                     // line 15
 dK = dS^T × Q                                   // line 16
 ```
 
-D_i 的推导：标准 softmax 的反向为 dS_{ij} = P_{ij}(dP_{ij} - \sum_k P_{ik} dP_{ik})。展开 \sum_k P_{ik} dP_{ik}，其中 dP = dO \times V^T，利用 O = PV 可以化简为 \sum_k O_{ik} \cdot dO_{ik} = D_i。预计算 D_i 避免在内层循环中重复求和。
+D_i 的推导：标准 softmax 的反向为 $dS_{ij} = P_{ij}(dP_{ij} - \sum_k P_{ik} dP_{ik})$。展开 $\sum_k P_{ik} dP_{ik}$ ，其中 $dP = dO \times V^T$，利用 O = PV 可以化简为 $\sum_k O_{ik} \cdot dO_{ik} = D_i$。预计算 D_i 避免在内层循环中重复求和。
 
 ## 2. Triton 实现分析
 
@@ -490,7 +490,7 @@ Causal Attention 矩阵 (N_CTX=5 块, pid=2):
 
          K,V 块 →    0     1     2     3     4
                   ┌─────┬─────┬─────┬─────┬─────┐
-  Q 块  0         │  ◉  │  ×  │  ×  │  ×  │  ×  │
+   Q 块  0        │  ◉  │  ×  │  ×  │  ×  │  ×  │
          1        │  √  │  ◉  │  ×  │  ×  │  ×  │
          2  ←pid  │  √  │  √  │  ◉  │  ×  │  ×  │  ← dQ 处理这行
          3        │  √  │  √  │  √  │  ◉  │  ×  │

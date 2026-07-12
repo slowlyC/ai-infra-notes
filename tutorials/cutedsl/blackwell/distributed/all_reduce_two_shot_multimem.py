@@ -68,24 +68,23 @@ except RuntimeError as exc:
 
 
 """
-A Distributed Two-Shot All-Reduce Example using CuTe DSL and PyTorch Symmetric Memory.
+使用 CuTe DSL 和 PyTorch Symmetric Memory 的分布式 Two-Shot All-Reduce 示例.
 
-This example kernel demonstrates how to leverage the multimem feature to do a two-shot all-reduce.
-The multimem instruction is operated on symmetric memory, it can offload the broadcast and reduce 
-to the Nvlink Switch so that the nvlink traffic will be reduced.
+这个示例 kernel 演示如何利用 multimem 功能实现 two-shot all-reduce.
+multimem instruction 操作 symmetric memory, 可以把 broadcast 和 reduce 卸载到 NVLink Switch,
+从而减少 NVLink traffic.
 
-When calling a 'multimem.ld_reduce addrA', the corresponding data from each remote device will be sent to the NVLS 
-and return the reduced data as result. And for 'multimem.st dataA addrA', the data will be sent to the NVLS once and 
-the data will be broadcast to each remote device. So the memory traffic and instruction count is reduced by 8 times 
-with multimem.
+调用 `multimem.ld_reduce addrA` 时, 各 device 上对应的数据会被发送到 NVLS, 并将归约结果返回.
+对于 `multimem.st dataA addrA`, 数据只需发送到 NVLS 一次, 再由 NVLS broadcast 到各 device.
+因此, multimem 可以将 memory traffic 和 instruction count 降低 8 倍.
 
-In this example, we are using two-shot styled all-reduce which means each device computes a portion
-of data and stores them to each device. Compared to the one-shot styled all-reduce, the two-shot one can 
-maximize the performance of throughput. The input and output are symmetric memory so we don't need extra 
-communication buffers here. We use the `sm_wise_inter_gpu_multimem_barrier` to synchronize the data 
-between each device. It is to make sure that each device has done the data transfer.
+本示例使用 two-shot 风格的 all-reduce, 即每个 device 计算一部分数据, 再把结果写到所有 devices.
+与 one-shot all-reduce 相比, two-shot 可以获得更高的吞吐性能.
+input 和 output 都是 symmetric memory, 因此这里不需要额外的 communication buffers.
+使用 `sm_wise_inter_gpu_multimem_barrier` 同步各 device 间的数据,
+以确保每个 device 都已完成 data transfer.
 
-To run this example:
+运行示例:
 
 .. code-block:: bash
 
@@ -94,7 +93,28 @@ To run this example:
         --M 1024 --N 1024 --benchmark --warmup_iterations 2 --iterations 100
 """
 
-
+# 每个 tile 只由负责它的 rank 归约一次, broadcast 后所有 ranks 都得到完整 output.
+#
+# 数据流示例, world_size=2, total_tiles=4, chunk_size=2:
+#
+# tile 负责关系:
+#   rank 0 CTAs -> tile 0, tile 1
+#   rank 1 CTAs -> tile 2, tile 3
+#
+# rank 0 input: [A0 A1 | A2 A3]
+# rank 1 input: [B0 B1 | B2 B3]
+#                  |      |
+#                  |      \-> rank 1 CTAs: (A2,B2)->S2, (A3,B3)->S3
+#                  \--------> rank 0 CTAs: (A0,B0)->S0, (A1,B1)->S1
+#
+# rank 0 CTAs: [S0 S1] --multimem.st--> rank 0 output: [S0 S1 | -- --]
+#                                    \-> rank 1 output: [S0 S1 | -- --]
+# rank 1 CTAs: [S2 S3] --multimem.st--> rank 0 output: [-- -- | S2 S3]
+#                                    \-> rank 1 output: [-- -- | S2 S3]
+#
+# rank 0 output: [S0 S1 | S2 S3]
+# rank 1 output: [S0 S1 | S2 S3]
+#
 @cute.kernel
 def all_reduce_multimem_kernel(
     gIn: cute.Tensor,
@@ -109,9 +129,8 @@ def all_reduce_multimem_kernel(
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
 
-    # slice for CTAs
+    # 为 CTAs 切分 tile
     # logical id -> address
-
     num_ctas = cute.size(gIn, mode=[1])
     chunk_size = num_ctas // world_size
     blk_idx = local_rank * chunk_size + bidx
@@ -137,18 +156,20 @@ def all_reduce_multimem_kernel(
     (_, rest_m_stride), _, _ = thr_in.stride
 
     for i in cutlass.range_constexpr(rest_m):
+        # Shot 1 (reduce): 从所有 ranks 的 multicast input 归约对应的 4 个 float32.
         x, y, z, w = utils.distributed.multimem_ld_reduce_4xf32(
             thr_in[(None, i), 0, 0].iterator
         )
+        # Shot 2 (broadcast): 将归约结果写入所有 ranks 的 multicast output.
         utils.distributed.multimem_st_4xb32(
             thr_out[(None, i), 0, 0].iterator, x, y, z, w
         )
 
-    # Ensure all threads in cta have finish issue multimem.ld_reduce and multimem.st instructions
+    # 确保 CTA 中所有 threads 都已发出 multimem.ld_reduce 和 multimem.st instructions
     cute.arch.sync_threads()
 
     if tidx == 0:
-        # Linear id of current SM.
+        # 当前 CTA 的 linear id.
         sm_id_linear = (
             cute.arch.block_idx()[0]
             + cute.arch.block_idx()[1] * cute.arch.grid_dim()[0]
@@ -156,13 +177,15 @@ def all_reduce_multimem_kernel(
             * cute.arch.grid_dim()[0]
             * cute.arch.grid_dim()[1]
         )
-        # Release flag with sys scope
+        # 向所有 Ranks 发送到达通知,
+        # 该操作的语义是对所有 ranks 的 local_flag[sm_id_linear] 加 1
         utils.distributed.multimem_red_add1(
             flag_mc.iterator + sm_id_linear,
             scope="sys",
             order="release",
         )
-        # Relaxed spin-lock wait flag with sys scope
+        # 以 sys scope 使用 relaxed spin-lock 等待 flag
+        # 每个 rank 轮询自己的 local_flag[sm_id_linear], 直到 flag == world_size
         utils.distributed.spin_lock_atom_cas_relaxed_wait(
             flag.iterator + sm_id_linear,
             expected_val=world_size,
@@ -183,7 +206,7 @@ def all_reduce_multimem(
     dtype = mIn.element_type
     vector_size = copy_bits // dtype.width
 
-    # we choose a 128x128 tile for a CTA
+    # 为每个 CTA 选择 128x128 tile
     thr_layout = cute.make_ordered_layout((4, 32), order=(1, 0))
     val_layout = cute.make_ordered_layout((32, vector_size), order=(1, 0))
     tiler_mn, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
@@ -271,7 +294,7 @@ def run_all_reduce_multimem(
             if i != local_rank:
                 nvshmem.core.free_tensor(local_buffers[i])
 
-    # always free the multicast tensors first
+    # 始终先释放 multicast tensors
     nvshmem.core.free_tensor(input_tensor)
     nvshmem.core.free_tensor(output_tensor)
     nvshmem.core.free_tensor(flag_mc)
@@ -318,7 +341,7 @@ def run_all_reduce_multimem(
     dist.barrier(device_ids=[local_rank])
     torch.cuda.synchronize()
 
-    # Print execution results
+    # 打印执行结果
     if local_rank == 0:
         print(f"Kernel execution time: {avg_time_us / 1e3:.4f} ms")
         print(
@@ -332,29 +355,29 @@ def run_all_reduce_multimem(
 
 def torchrun_uid_init_bcast():
     """
-    Initialize NVSHMEM using UniqueID with `torchrun` as the launcher
+    使用 UniqueID 初始化 NVSHMEM, 并以 `torchrun` 作为 launcher.
 
-    It uses torch.distributed.broadcast on a NumPy array to handle the broadcasting
+    这里通过 torch.distributed.broadcast 广播 NumPy array.
     """
-    # Set Torch device
+    # 设置 Torch device
     local_rank = int(os.environ['LOCAL_RANK'])
     torch.cuda.set_device(local_rank)
 
-    # nvshmem4py requires a cuda.core Device at init time
+    # nvshmem4py 初始化时需要 cuda.core Device
     dev = Device(local_rank)
     dev.set_current()
     global stream
     stream = dev.create_stream()
 
-    # Initialize torch.distributed process group
+    # 初始化 torch.distributed process group
     dist.init_process_group(
         backend="cpu:gloo,cuda:nccl",
     )
 
-    # Extract rank, nranks from process group
+    # 从 process group 取 rank 和 nranks
     num_ranks = dist.get_world_size()
 
-    # Create an empty uniqueid for all ranks
+    # 为所有 ranks 创建空 uniqueid
     uid = nvshmem.core.get_unique_id(empty=(local_rank != 0))
     uid_bytes = uid._data.view(np.uint8).copy()
     uid_tensor = torch.from_numpy(uid_bytes).cuda()
@@ -372,7 +395,7 @@ def torchrun_finalize():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="example of elementwise add to demonstrate the numpy/pytorch as input for kernels"
+        description="elementwise add 示例, 用于演示 kernel 如何接收 numpy/pytorch 输入"
     )
     parser.add_argument("--M", default=1024, type=int)
     parser.add_argument("--N", default=1024, type=int)
