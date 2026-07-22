@@ -6,9 +6,9 @@
 >
 > 推荐阅读: [Songlin Yang 的 DeltaNet 系列博客](https://sustcsonglin.github.io/blog/2024/deltanet-2/) | [苏剑林：线性注意力简史——从模仿、创新到反哺](https://kexue.fm/archives/11033)
 
-与 Qwen3-next 相同，新发布的 Qwen3.5 模型也采用了 GDN 结构(Gated Delta Networks)，笔者也在从事 Qwen3.5 GDN Kernel 的训推优化工作。本文将结合 flash-linear-attention 中的 GDN 代码和工作中的优化经验，从算法原理和代码层面详细分析 GDN 的实现细节。下面从直觉上来理解，
+Qwen3.5 系列模型采用了 GDN 结构(Gated Delta Networks)，笔者在其中从事 GDN Kernel 的训推优化工作。本文将结合 flash-linear-attention 中的 GDN 代码实现以及工作中的优化经验，从算法原理和代码层面详细分析 GDN 的实现细节。
 
-文章前半部分介绍 GDN 的数学原理和公式推导，后半部分结合代码逐步解析实现。如果对原理已有了解或只关注代码实现，可以直接从[第 4 节](#4-模型调用方式以-qwen35-gateddeltanet-为例)开始阅读(ps: 直接看代码更容易理解 ^ _ ^)。
+文章前半部分介绍 GDN 的数学原理和公式推导，后半部分结合代码逐步解析实现。如果对原理已有了解或只关注代码实现，可以直接从[第 4 节](#4-模型调用方式以-qwen35-gateddeltanet-为例)开始阅读(ps: 直接看代码更容易理解)。
 
 ## 目录
 
@@ -870,7 +870,7 @@ $$
 
 上一步得到的 A 就是严格下三角部分。因为 $(\mathbf{I} + A)$ 是下三角且对角线为 1，可以用前代法（forward substitution）逐行求解其逆矩阵，而不需要通用矩阵求逆。
 
-实现上采用两级分块策略（代码位于 `fla/ops/utils/solve_tril.py`）。FLA 对 BT=64 使用融合版本 `merge_16x16_to_64x64_inverse_kernel`，在单个 kernel 内完成两级操作：先对 4 个 16x16 对角块逐行前代求逆，再通过分块矩阵公式合并为 64x64 逆矩阵。BT=16 使用 `solve_tril_16x16_kernel`，BT=32 使用 `merge_16x16_to_32x32_inverse_kernel`，同样是融合两级操作。该 kernel 支持 Hopper+ GPU 上的 TMA（Tensor Memory Accelerator）加载/存储，以及通过环境变量 `FLA_TRIL_PRECISION` 控制 `tl.dot` 的精度（ieee/tf32/tf32x3 可选，默认 ieee），在 autotune 中自动搜索最优精度配置。笔者在实际测试中发现，部分场景下拆成两个 kernel（FLA 之前的实现，分别做 16x16 求逆和块间合并）反而效果更好，这可能与 kernel launch overhead 和寄存器压力的权衡有关。
+实现上采用两级分块策略（代码位于 `fla/ops/utils/solve_tril.py`）。FLA 对 BT=64 使用融合版本 `merge_16x16_to_64x64_inverse_kernel`，在单个 kernel 内完成两级操作：先对 4 个 16x16 对角块逐行前代求逆，再通过分块矩阵公式合并为 64x64 逆矩阵。BT=16 使用 `solve_tril_16x16_kernel`，BT=32 使用 `merge_16x16_to_32x32_inverse_kernel`，同样是融合两级操作。该 kernel 支持 Hopper+ GPU 上的 TMA（Tensor Memory Accelerator）加载/存储，以及通过环境变量 `FLA_TRIL_PRECISION` 控制 `tl.dot` 的精度（ieee/tf32/tf32x3 可选，默认 ieee），在 autotune 中自动搜索最优精度配置。笔者在实际测试中发现，部分场景下拆成两个 kernel（分别做 16x16 求逆和块间合并）效果反而更好，这可能与 kernel launch overhead 和寄存器压力的权衡有关。
 
 以 BT=64 的 `merge_16x16_to_64x64_inverse_kernel` 为例，简化后的核心逻辑如下：
 

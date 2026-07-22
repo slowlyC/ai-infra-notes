@@ -2,7 +2,7 @@
 
 本文记录了对 FLA（Flash Linear Attention）中 `chunk_local_cumsum_scalar_kernel` 的性能分析和优化过程。背景是对 Qwen3.5/Qwen3-NEXT 模型中 GDN kernel 进行 NCU profiling 发现该 kernel 存在访存未合并问题后，通过将 1D scan 改为 2D scan 引导编译器生成向量化访存指令，长序列下获得约 5 倍加速。
 
-关于 `tl.cumsum` 从 Python 到 PTX 的完整编译流程分析，参见 [Triton Scan Op 编译全流程](https://zhuanlan.zhihu.com/p/2007221164263624909)。相关代码已开源至Sglang。
+关于 `tl.cumsum` 从 Python 到 PTX 的完整编译流程分析，参见 [Triton Scan Op 编译全流程分析](https://zhuanlan.zhihu.com/p/2007221164263624909)。相关代码已开源至Sglang。
 
 ## 一、背景：FLA 中的 cumsum 操作
 
@@ -583,7 +583,8 @@ Warp scan 需要沿 axis=0 传播，所以第一轮 `shfl.sync.up` 的 offset = 
 
 ## 六、vector cumsum：另一种 scan 实现
 
-除了 scalar cumsum，代码中还有一个 `chunk_local_cumsum_vector_kernel`，用于 4D 输入 `[B, T, H, S]`。它使用了完全不同的算法——矩阵乘法实现 cumsum：
+除了 Scan 算法，对于 4D 输入 [B, T, H, S]，还可以使用矩阵乘法来实现 cumsum，从而使用 Tensor Core，在大 size 下会有较好的性能。相关代码如下：
+
 
 ```python
 @triton.autotune(
@@ -631,7 +632,7 @@ m_s = [[1, 0, 0, ...],
 cumsum(x) = m_s @ x
 ```
 
-这种方法用 `O(BT^2 * BS)` 的计算换取更好的访存模式（可以利用 tensor core）。对于 vector 情况（S 维度较大），matmul 的吞吐量优势明显。
+这种方法用 `O(BT^2 * BS)` 的计算复杂度换取更好的硬件效率（可以利用 tensor core）。对于 vector 情况（S 维度较大），matmul 的吞吐量优势明显。
 
 对比三种 kernel 的特点：
 

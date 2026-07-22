@@ -1,8 +1,8 @@
-# Triton Scan Op 编译全流程
+# Triton Scan Op 编译全流程分析
 
-在对 Qwen3.5/Qwen3-NEXT 模型中 GDN kernel 进行性能分析和优化的过程中，我们对 cumsum kernel 做了访存优化（参见 [cumsum 访存优化](https://zhuanlan.zhihu.com/p/2007222509582426207)）。 在这一过程中 autotune 结果显示 num_warps=1 的配置在大部分场景性能最优，出于对 Triton scan 实现的好奇，进一步追溯了编译器对 scan 算子的完整编译流程和 ir 实现。
+在对 Qwen3.5/Qwen3-NEXT 模型中 GDN kernel 进行性能分析和优化的过程中，我们对 cumsum kernel 做了访存优化（参见 [cumsum 访存优化](https://zhuanlan.zhihu.com/p/2007222509582426207)）。 在这一过程中 autotune 结果显示 num_warps=1 的配置在大部分场景性能最优，出于对性能的极致分析，进一步追溯了编译器对 scan 算子的完整编译流程和 ir 实现。
 
-本文从 `tl.cumsum` 的 Python 调用出发，拆解到最终 PTX 代码，覆盖 TTIR、TTGIR、LLVM IR、PTX 各阶段的 IR 变换，以及 scan 算法的底层实现（thread 内串行、warp 内 Kogge-Stone、跨 warp shared memory 协调）。
+本文从 `tl.cumsum` 的 Python 调用出发，详细拆解到最终的 PTX 代码，覆盖 TTIR、TTGIR、LLVM IR、PTX 各阶段的 IR 变换，以及 scan 算法的底层实现（thread 内串行、warp 内 shuffle、跨 warp shared memory 协调）。
 
 所用 Triton 版本：3.5.0+git50d10bdd
 

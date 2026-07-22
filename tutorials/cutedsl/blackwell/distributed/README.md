@@ -10,9 +10,44 @@
 2. `all_reduce_one_shot_lamport.py`，通信 buffer 风格的 one-shot all-reduce。重点看 ping-pong buffer、negative zero sentinel、`.SYS` memory scope 和 `.VOLATILE` memory order。
 3. `all_reduce_two_shot_multimem.py`，基于 `multimem` 的 two-shot all-reduce。重点看 `multimem.ld_reduce`、`multimem.st`、`multimem.red` 以及 flag 同步。
 4. `all_reduce_tma.py`，把 two-shot all-reduce 和 TMA pipeline 结合起来。重点看每个 CTA 从所有 rank TMA load、register accumulation、TMA multicast store 和 cross-GPU barrier。
-5. `distributed_all_gather_gemm_blackwell.py`，先看这个 fused GEMM 示例。它是 all-gather + dense GEMM，通信和 GEMM 的耦合相对清楚，适合作为进入大文件的入口。
-6. `distributed_gemm_all_reduce_blackwell.py`，再看 GEMM + all-reduce epilogue。重点看 `use_tma_store=True` 时如何在 epilogue 里接入 `LDMCxSTMC`。
+5. `distributed_gemm_all_reduce_blackwell.py`，接着看 GEMM + all-reduce epilogue。它延续前面的 two-shot tile ownership，重点看 `use_tma_store=True` 时如何在 epilogue 里接入 `LDMCxSTMC`，让每个 rank 只计算一部分 output，再将归约结果 broadcast 到所有 ranks。
+6. `distributed_all_gather_gemm_blackwell.py`，再看 all-gather + dense GEMM。这里通信从 output epilogue 转到 GEMM input 一侧，适合在理解 GEMM + all-reduce 后对比两种融合位置。
 7. `distributed_gemm_reduce_scatter_blackwell.py`，最后看 reduce-scatter 版本。它和 all-reduce GEMM 很接近，但多了按 rank 分片输出和 tile ownership 的理解负担。
+
+## All-Reduce 实现对比
+
+`one-shot` 和 `two-shot` 描述的是 collective algorithm 的阶段与工作划分，`TMA` 和 `multimem` 描述的是 data movement primitive。因此，`all_reduce_tma.py` 在算法上也是 two-shot，只是它用逐 rank TMA load、SMEM pipeline 和显式加法替代了 `multimem.ld_reduce`。
+
+| 实现 | 数据流与工作划分 | 每个 rank 的额外通信存储 | 适用场景 |
+|------|------------------|--------------------------|----------|
+| `all_reduce_simple.py` | 每个 rank 直接读取所有 peer inputs，并重复计算完整 output | 无 tensor-sized communication buffer | 教学和 correctness baseline；world size 较小，且 input 可被所有 peers 直接访问 |
+| `all_reduce_one_shot_lamport.py` | 每个 rank 将本地 input fan-out 到所有 ranks 的 inbox，再从本地 inbox 归约完整 output | 当前实现约为 `PING_PONG_SIZE * world_size * tensor_size`，其中 `PING_PONG_SIZE=3` | 小消息、低延迟；原始 input 不能被远端直接访问，但可以使用 symmetric communication buffer |
+| `all_reduce_two_shot_multimem.py` | 每个 rank 只归约 `1 / world_size` 的 output，使用 `multimem.ld_reduce` reduce，再用 `multimem.st` broadcast | 无 tensor-sized communication buffer，只有同步 flags | 支持 NVLS/NVSwitch 的单机中大消息和高吞吐场景 |
+| `all_reduce_tma.py` | 使用 two-shot tile ownership；逐 rank TMA load 到两级 SMEM，consumer 显式累加，再 TMA multicast store | 无 tensor-sized global communication buffer；每个 CTA 使用两级 SMEM | 学习 distributed TMA pipeline，或需要在 SMEM/RMEM 中插入自定义转换和归约逻辑 |
+
+四种实现的数据流可以简化为：
+
+```text
+simple:
+  all peer GMEM -> per-thread RMEM -> ADD -> local full output
+
+one-shot Lamport:
+  local input -> fan-out to all symmetric inboxes -> local ADD -> local full output
+
+two-shot multimem:
+  assigned output slice -> multimem.ld_reduce -> multimem.st -> all ranks
+
+two-shot TMA:
+  assigned output tile -> peer TMA loads -> SMEM ping-pong -> RMEM ADD
+                       -> TMA multicast store -> all ranks
+```
+
+性能没有脱离 message size、world size、dtype 和 GPU topology 的固定排序。一般情况下：
+
+- 小消息和较少 ranks 下，`simple` 与 one-shot 都应以实测延迟为准；one-shot 用额外显存换取 communication buffer 和单阶段 fan-out。
+- 支持 NVLS 时，two-shot multimem 通常更适合中大消息和吞吐优先的场景，因为每个输出元素只归约一次，并把 reduce/broadcast 卸载到 NVLink Switch。
+- 当前 TMA 版本用于教学，并非面向 standalone All-Reduce 性能优化；它的价值主要是 pipeline 和自定义融合能力。
+- `distributed_gemm_all_reduce_blackwell.py` 使用的是 two-shot multimem 路径，即 `LDMCxSTMC`，不是 `all_reduce_tma.py` 的软件累加路径。
 
 ## NVSHMEM 依赖
 

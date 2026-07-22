@@ -91,6 +91,45 @@ class AllReduceTmaKernel:
 
     我们按照 codomain (physical offset) 顺序线性遍历 tensors,
     从而保证所有 tensors 的 logical coordinate 访问保持一致.
+
+    每个 tile 只由负责它的 rank 归约一次, TMA multicast store 后所有 ranks 都得到完整 output.
+    
+    数据流示例, world_size=2, total_tiles=4, ctas_per_rank=2:
+    
+    tile 负责关系:
+      rank 0 CTAs -> tile 0, tile 1
+      rank 1 CTAs -> tile 2, tile 3
+    
+    rank 0 input: [A0 A1 | A2 A3]
+    rank 1 input: [B0 B1 | B2 B3]
+    
+    rank 0 CTA 0, tile 0:
+      A0 --TMA Load--> stage 0 (ping) --\
+      B0 --TMA Load--> stage 1 (pong) ---+--> consumer ADD --> stage 0 = S0
+    
+    rank 0 CTA 1, tile 1:
+      A1 --TMA Load--> stage 0 (ping) --\
+      B1 --TMA Load--> stage 1 (pong) ---+--> consumer ADD --> stage 0 = S1
+    
+    rank 1 CTA 0, tile 2:
+      A2 --TMA Load--> stage 0 (ping) --\
+      B2 --TMA Load--> stage 1 (pong) ---+--> consumer ADD --> stage 0 = S2
+    
+    rank 1 CTA 1, tile 3:
+      A3 --TMA Load--> stage 0 (ping) --\
+      B3 --TMA Load--> stage 1 (pong) ---+--> consumer ADD --> stage 0 = S3
+    
+    各 CTA 将自己的 stage 0 结果写入所有 ranks 的对应 output tile:
+      rank 0 CTA 0: S0 --TMA multicast store--> all ranks output tile 0
+      rank 0 CTA 1: S1 --TMA multicast store--> all ranks output tile 1
+      rank 1 CTA 0: S2 --TMA multicast store--> all ranks output tile 2
+      rank 1 CTA 1: S3 --TMA multicast store--> all ranks output tile 3
+    
+    rank 0 output: [S0 S1 | S2 S3]
+    rank 1 output: [S0 S1 | S2 S3]
+    
+    world_size > 2 时, 各 rank 的输入 tile 按 stage 0, 1, 0, 1, ... 循环复用.
+    
     """
 
     _elems_per_cta: int = 128 * 128  # 每个 CTA 处理的 elements 数量
